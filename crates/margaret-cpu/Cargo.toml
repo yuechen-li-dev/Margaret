@@ -1,0 +1,11 @@
+[package]
+name = "margaret-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+margaret-core.workspace = true
+
+[dev-dependencies]
+margaret-testutil.workspace = true

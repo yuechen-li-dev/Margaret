@@ -1,3 +1,23 @@
 [workspace]
-members = []
+members = [
+    "crates/margaret-cli",
+    "crates/margaret-core",
+    "crates/margaret-cpu",
+    "crates/margaret-image",
+    "crates/margaret-testutil",
+    "crates/margaret-vk",
+]
 resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+margaret-cli = { path = "crates/margaret-cli" }
+margaret-core = { path = "crates/margaret-core" }
+margaret-cpu = { path = "crates/margaret-cpu" }
+margaret-image = { path = "crates/margaret-image" }
+margaret-testutil = { path = "crates/margaret-testutil" }
+margaret-vk = { path = "crates/margaret-vk" }
