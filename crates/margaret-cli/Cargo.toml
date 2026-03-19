@@ -1,0 +1,10 @@
+[package]
+name = "margaret-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+margaret-core.workspace = true
+margaret-cpu.workspace = true
+margaret-image.workspace = true
