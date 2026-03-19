@@ -35,6 +35,7 @@ impl CpuRendererBackend {
         image_size: ImageSize,
         render_settings: RenderSettings,
     ) -> RenderMetadata {
+        validate_supported_scene(scene);
         let sample_count = match render_settings.mode {
             RenderMode::Lit => LIT_SAMPLES_PER_PIXEL,
             RenderMode::Debug(_) => 1,
@@ -57,6 +58,7 @@ impl CpuRendererBackend {
         image_size: ImageSize,
         render_settings: RenderSettings,
     ) -> OwnedImage {
+        validate_supported_scene(scene);
         let mut image = OwnedImage::new(image_size, miss_color(render_settings.mode));
         let emissive_triangles = collect_emissive_triangles(scene);
 
@@ -81,6 +83,16 @@ impl CpuRendererBackend {
         }
 
         image
+    }
+}
+
+fn validate_supported_scene(scene: &SceneDescription) {
+    for material in &scene.materials {
+        assert!(
+            !material.has_unsupported_m3a_diffuse_emission_mix(),
+            "M3a does not support diffuse materials with both non-black albedo and non-black emission: '{}'",
+            material.name,
+        );
     }
 }
 
@@ -671,8 +683,9 @@ mod tests {
     use super::{
         build_dielectric_event, build_path_event, closest_hit, color_rgb_to_rgba8, find_material,
         intersect_triangle, miss_color, reflect, sample_cosine_weighted_hemisphere,
-        schlick_fresnel, trace_lit_path, CpuRendererBackend, PathEvent, PixelRng, SceneHit,
-        DEPTH_MISS_COLOR, LIT_SAMPLES_PER_PIXEL, MAX_PATH_VERTICES, MIN_HIT_DISTANCE, MISS_COLOR,
+        schlick_fresnel, trace_lit_path, validate_supported_scene, CpuRendererBackend, PathEvent,
+        PixelRng, SceneHit, DEPTH_MISS_COLOR, LIT_SAMPLES_PER_PIXEL, MAX_PATH_VERTICES,
+        MIN_HIT_DISTANCE, MISS_COLOR,
     };
     use margaret_core::camera::Camera;
     use margaret_core::color::{ColorRgb, ColorRgba8};
@@ -1001,6 +1014,98 @@ mod tests {
     }
 
     #[test]
+    fn dielectric_front_face_refraction_uses_air_to_glass_eta() {
+        let hit = SceneHit {
+            distance: 1.0,
+            position: Point3::ORIGIN,
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            front_face: true,
+            material_id: MaterialId(0),
+        };
+        let ray = Ray::new(
+            Point3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.707_106_77, 0.0, -0.707_106_77),
+        );
+
+        let event = build_dielectric_event(ray, &hit, 1.5);
+
+        let PathEvent::Dielectric {
+            fresnel_reflectance,
+            reflected_ray,
+            refracted_ray,
+        } = event
+        else {
+            panic!("expected dielectric event");
+        };
+
+        assert!((fresnel_reflectance - 0.042_069_27).abs() <= 0.000_001);
+        assert_vec3_near(
+            reflected_ray.direction,
+            Vec3::new(0.707_106_77, 0.0, 0.707_106_77),
+            0.000_001,
+        );
+
+        let refracted_ray = refracted_ray.expect("expected transmitted ray");
+        assert_vec3_near(
+            refracted_ray.direction,
+            Vec3::new(0.471_404_55, 0.0, -0.881_917_1),
+            0.000_001,
+        );
+    }
+
+    #[test]
+    fn dielectric_back_face_refraction_uses_glass_to_air_eta() {
+        let hit = SceneHit {
+            distance: 1.0,
+            position: Point3::ORIGIN,
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            front_face: false,
+            material_id: MaterialId(0),
+        };
+        let ray = Ray::new(
+            Point3::new(0.0, 0.0, -1.0),
+            Vec3::new(0.5, 0.0, 0.866_025_4),
+        );
+
+        let event = build_dielectric_event(ray, &hit, 1.5);
+
+        let PathEvent::Dielectric {
+            fresnel_reflectance,
+            reflected_ray,
+            refracted_ray,
+        } = event
+        else {
+            panic!("expected dielectric event");
+        };
+
+        assert!((fresnel_reflectance - 0.040_041_436).abs() <= 0.000_001);
+        assert_vec3_near(
+            reflected_ray.direction,
+            Vec3::new(0.5, 0.0, -0.866_025_4),
+            0.000_001,
+        );
+
+        let refracted_ray = refracted_ray.expect("expected transmitted ray");
+        assert_vec3_near(
+            refracted_ray.direction,
+            Vec3::new(0.75, 0.0, 0.661_437_8),
+            0.000_001,
+        );
+    }
+
+    #[test]
+    fn dielectric_transmission_keeps_emissive_hits_visible_on_delta_paths() {
+        let scene = glass_transmission_scene();
+        let lights = super::collect_emissive_triangles(&scene);
+        let ray = Ray::new(Point3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 0.0, -1.0));
+        let mut rng = PixelRng::new(12, 13);
+
+        let color = trace_lit_path(&scene, ray, &lights, &mut rng, MAX_PATH_VERTICES, true);
+
+        assert_color_near(color, ColorRgb::new(2.88, 2.4, 1.92), 0.000_001);
+    }
+
+    #[test]
     fn build_path_event_reflects_mirror_direction() {
         let material = MaterialDescription::new(
             MaterialId(0),
@@ -1084,6 +1189,31 @@ mod tests {
         let scene = lit_room_scene();
 
         assert!(find_material(&scene, MaterialId(99)).is_none());
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "M3a does not support diffuse materials with both non-black albedo and non-black emission"
+    )]
+    fn validate_supported_scene_rejects_mixed_diffuse_emission_materials() {
+        let camera = Camera::new(
+            "main",
+            Point3::new(0.0, 0.0, 2.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            Vec3::Y,
+            45.0,
+        );
+        let material_id = MaterialId(0);
+
+        let mut scene = SceneDescription::new("unsupported-mixed-emission", camera);
+        scene.materials.push(make_diffuse(
+            material_id,
+            "mixed-light",
+            ColorRgb::new(0.5, 0.5, 0.5),
+            ColorRgb::new(2.0, 2.0, 2.0),
+        ));
+
+        validate_supported_scene(&scene);
     }
 
     fn single_triangle_scene() -> SceneDescription {
