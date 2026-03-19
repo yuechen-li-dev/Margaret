@@ -7,11 +7,12 @@ use margaret_core::color::ColorRgb;
 use margaret_core::image::ImageSize;
 use margaret_core::material::{MaterialDescription, MaterialId, MaterialKind};
 use margaret_core::math::{Point3, Vec3};
-use margaret_core::render::{RenderDebugMode, RenderDebugSettings};
+use margaret_core::render::{RenderMode, RenderSettings};
 use margaret_core::scene::{Geometry, SceneDescription, SceneObject, Triangle};
 use margaret_cpu::CpuRendererBackend;
 
 const DEFAULT_DEPTH_MAX_DISTANCE: f32 = 6.0;
+const DEFAULT_OUTPUT_PATH: &str = "margaret-m2a-normals.ppm";
 
 pub fn run() -> std::io::Result<()> {
     run_from_args(env::args_os())
@@ -29,7 +30,7 @@ where
     let scene = hardcoded_scene();
     let backend = CpuRendererBackend::new();
     let metadata = backend.describe_render(&scene, config.image_size);
-    let image = backend.render(&scene, config.image_size, config.debug_settings);
+    let image = backend.render(&scene, config.image_size, config.render_settings);
 
     if let Some(parent) = config.output_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -39,10 +40,10 @@ where
 
     image.write_ppm(&config.output_path)?;
 
-    println!("Margaret M1b CPU debug render");
+    println!("Margaret M2a CPU direct-light render");
     println!("scene: {}", metadata.scene_name);
     println!("backend: {}", metadata.backend_name);
-    println!("mode: {}", config.debug_settings.mode.as_str());
+    println!("mode: {}", config.render_settings.mode.as_str());
     println!(
         "image: {}x{} {:?}",
         metadata.image_size.width, metadata.image_size.height, metadata.pixel_format
@@ -58,7 +59,7 @@ where
 #[derive(Debug, Clone, PartialEq)]
 struct CliConfig {
     pub image_size: ImageSize,
-    pub debug_settings: RenderDebugSettings,
+    pub render_settings: RenderSettings,
     pub output_path: PathBuf,
     pub show_help: bool,
 }
@@ -67,11 +68,11 @@ impl Default for CliConfig {
     fn default() -> Self {
         Self {
             image_size: ImageSize::new(320, 240),
-            debug_settings: RenderDebugSettings::new(
-                RenderDebugMode::GeometricNormals,
+            render_settings: RenderSettings::new(
+                RenderMode::Debug(margaret_core::render::RenderDebugMode::GeometricNormals),
                 DEFAULT_DEPTH_MAX_DISTANCE,
             ),
-            output_path: PathBuf::from("margaret-m1b-normals.ppm"),
+            output_path: PathBuf::from(DEFAULT_OUTPUT_PATH),
             show_help: false,
         }
     }
@@ -93,19 +94,19 @@ impl CliConfig {
                 "--mode" => {
                     let value = next_argument(&mut arguments, "--mode")?;
                     let value_text = value.to_string_lossy();
-                    let debug_mode = RenderDebugMode::parse(value_text.as_ref()).ok_or_else(|| {
+                    let render_mode = RenderMode::parse(value_text.as_ref()).ok_or_else(|| {
                         std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             format!(
-                                "unsupported render mode '{value_text}', expected normals, albedo, or depth"
+                                "unsupported render mode '{value_text}', expected normals, albedo, depth, or lit"
                             ),
                         )
                     })?;
-                    config.debug_settings.mode = debug_mode;
-                    if config.output_path == Path::new("margaret-m1b-normals.ppm") {
+                    config.render_settings.mode = render_mode;
+                    if config.output_path == Path::new(DEFAULT_OUTPUT_PATH) {
                         config.output_path = PathBuf::from(format!(
-                            "margaret-m1b-{}.ppm",
-                            config.debug_settings.mode.as_str()
+                            "margaret-m2a-{}.ppm",
+                            config.render_settings.mode.as_str()
                         ));
                     }
                 }
@@ -178,7 +179,7 @@ fn parse_dimension(value: &OsString, label: &str) -> std::io::Result<u32> {
 }
 
 fn print_usage() {
-    println!("Usage: margaret-cli [--mode normals|albedo|depth] [--width N] [--height N] [--output PATH]");
+    println!("Usage: margaret-cli [--mode normals|albedo|depth|lit] [--width N] [--height N] [--output PATH]");
 }
 
 fn hardcoded_scene() -> SceneDescription {
@@ -193,13 +194,15 @@ fn hardcoded_scene() -> SceneDescription {
     let red = MaterialId(0);
     let green = MaterialId(1);
     let white = MaterialId(2);
+    let light = MaterialId(3);
 
-    let mut scene = SceneDescription::new("m1b-hardcoded-debug-scene", camera);
+    let mut scene = SceneDescription::new("m2a-hardcoded-lit-scene", camera);
     scene.materials.push(MaterialDescription::new(
         red,
         "red",
         MaterialKind::Diffuse {
             albedo: ColorRgb::new(0.8, 0.2, 0.2),
+            emission: ColorRgb::BLACK,
         },
     ));
     scene.materials.push(MaterialDescription::new(
@@ -207,6 +210,7 @@ fn hardcoded_scene() -> SceneDescription {
         "green",
         MaterialKind::Diffuse {
             albedo: ColorRgb::new(0.2, 0.8, 0.2),
+            emission: ColorRgb::BLACK,
         },
     ));
     scene.materials.push(MaterialDescription::new(
@@ -214,6 +218,15 @@ fn hardcoded_scene() -> SceneDescription {
         "white",
         MaterialKind::Diffuse {
             albedo: ColorRgb::new(0.8, 0.8, 0.8),
+            emission: ColorRgb::BLACK,
+        },
+    ));
+    scene.materials.push(MaterialDescription::new(
+        light,
+        "ceiling-light",
+        MaterialKind::Diffuse {
+            albedo: ColorRgb::BLACK,
+            emission: ColorRgb::new(5.0, 4.8, 4.4),
         },
     ));
 
@@ -265,6 +278,14 @@ fn hardcoded_scene() -> SceneDescription {
         Point3::new(0.45, 0.2, -0.7),
         Point3::new(-0.45, 0.2, -0.2),
     ));
+    scene.objects.push(make_quad(
+        "light",
+        light,
+        Point3::new(-0.35, 0.99, -0.35),
+        Point3::new(0.35, 0.99, -0.35),
+        Point3::new(0.35, 0.99, 0.35),
+        Point3::new(-0.35, 0.99, 0.35),
+    ));
 
     scene
 }
@@ -288,18 +309,19 @@ fn make_quad(
 
 #[cfg(test)]
 mod tests {
-    use super::{hardcoded_scene, CliConfig, DEFAULT_DEPTH_MAX_DISTANCE};
-    use margaret_core::render::RenderDebugMode;
+    use super::{hardcoded_scene, run_from_args, CliConfig, DEFAULT_DEPTH_MAX_DISTANCE};
+    use margaret_core::render::{RenderDebugMode, RenderMode};
     use margaret_core::scene::Geometry;
     use std::ffi::OsString;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn hardcoded_scene_contains_box_like_triangle_scene() {
+    fn hardcoded_scene_contains_room_geometry_and_emissive_quad() {
         let scene = hardcoded_scene();
 
-        assert_eq!(scene.objects.len(), 6);
-        assert_eq!(scene.materials.len(), 3);
+        assert_eq!(scene.objects.len(), 7);
+        assert_eq!(scene.materials.len(), 4);
         assert_eq!(scene.lights.len(), 0);
 
         for object in &scene.objects {
@@ -324,15 +346,31 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(config.debug_settings.mode, RenderDebugMode::FlatAlbedo);
         assert_eq!(
-            config.debug_settings.depth_max_distance,
+            config.render_settings.mode,
+            RenderMode::Debug(RenderDebugMode::FlatAlbedo)
+        );
+        assert_eq!(
+            config.render_settings.depth_max_distance,
             DEFAULT_DEPTH_MAX_DISTANCE
         );
         assert_eq!(config.image_size.width, 64);
         assert_eq!(config.image_size.height, 48);
         assert_eq!(config.output_path, PathBuf::from("frame.ppm"));
         assert!(!config.show_help);
+    }
+
+    #[test]
+    fn cli_config_parses_lit_mode() {
+        let config = CliConfig::parse(vec![
+            OsString::from("margaret-cli"),
+            OsString::from("--mode"),
+            OsString::from("lit"),
+        ])
+        .unwrap();
+
+        assert_eq!(config.render_settings.mode, RenderMode::Lit);
+        assert_eq!(config.output_path, PathBuf::from("margaret-m2a-lit.ppm"));
     }
 
     #[test]
@@ -356,7 +394,38 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(config.debug_settings.mode, RenderDebugMode::Depth);
-        assert_eq!(config.output_path, PathBuf::from("margaret-m1b-depth.ppm"));
+        assert_eq!(
+            config.render_settings.mode,
+            RenderMode::Debug(RenderDebugMode::Depth)
+        );
+        assert_eq!(config.output_path, PathBuf::from("margaret-m2a-depth.ppm"));
+    }
+
+    #[test]
+    fn run_from_args_writes_lit_image_to_disk() {
+        let mut output_path = std::env::temp_dir();
+        let unique_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        output_path.push(format!("margaret-lit-test-{unique_id}.ppm"));
+
+        run_from_args(vec![
+            OsString::from("margaret-cli"),
+            OsString::from("--mode"),
+            OsString::from("lit"),
+            OsString::from("--width"),
+            OsString::from("16"),
+            OsString::from("--height"),
+            OsString::from("12"),
+            OsString::from("--output"),
+            output_path.as_os_str().to_os_string(),
+        ])
+        .unwrap();
+
+        let metadata = std::fs::metadata(&output_path).unwrap();
+        assert!(metadata.len() > 0);
+
+        std::fs::remove_file(output_path).unwrap();
     }
 }
