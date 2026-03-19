@@ -25,6 +25,7 @@ pub fn sample_scene() -> SceneDescription {
         "matte-gray",
         MaterialKind::Diffuse {
             albedo: ColorRgb::new(0.5, 0.5, 0.5),
+            emission: ColorRgb::BLACK,
         },
     ));
     scene.objects.push(SceneObject::new(

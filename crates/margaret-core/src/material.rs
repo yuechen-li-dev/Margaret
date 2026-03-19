@@ -19,14 +19,27 @@ impl MaterialDescription {
         }
     }
 
-    pub fn flat_albedo(&self) -> ColorRgb {
+    pub fn diffuse_albedo(&self) -> ColorRgb {
         match self.kind {
-            MaterialKind::Diffuse { albedo } => albedo,
+            MaterialKind::Diffuse { albedo, .. } => albedo,
         }
+    }
+
+    pub fn emissive_radiance(&self) -> ColorRgb {
+        match self.kind {
+            MaterialKind::Diffuse { emission, .. } => emission,
+        }
+    }
+
+    pub fn is_emissive(&self) -> bool {
+        self.emissive_radiance() != ColorRgb::BLACK
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MaterialKind {
-    Diffuse { albedo: ColorRgb },
+    Diffuse {
+        albedo: ColorRgb,
+        emission: ColorRgb,
+    },
 }

@@ -1,3 +1,5 @@
+use std::ops::{Add, AddAssign, Mul};
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ColorRgb {
     pub r: f32,
@@ -11,6 +13,38 @@ impl ColorRgb {
 
     pub const fn new(r: f32, g: f32, b: f32) -> Self {
         Self { r, g, b }
+    }
+}
+
+impl Add for ColorRgb {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Self::new(self.r + rhs.r, self.g + rhs.g, self.b + rhs.b)
+    }
+}
+
+impl AddAssign for ColorRgb {
+    fn add_assign(&mut self, rhs: Self) {
+        self.r += rhs.r;
+        self.g += rhs.g;
+        self.b += rhs.b;
+    }
+}
+
+impl Mul<f32> for ColorRgb {
+    type Output = Self;
+
+    fn mul(self, rhs: f32) -> Self::Output {
+        Self::new(self.r * rhs, self.g * rhs, self.b * rhs)
+    }
+}
+
+impl Mul<ColorRgb> for ColorRgb {
+    type Output = Self;
+
+    fn mul(self, rhs: ColorRgb) -> Self::Output {
+        Self::new(self.r * rhs.r, self.g * rhs.g, self.b * rhs.b)
     }
 }
 
