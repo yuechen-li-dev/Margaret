@@ -12,7 +12,7 @@ use margaret_core::scene::{Geometry, SceneDescription, SceneObject, Triangle};
 use margaret_cpu::CpuRendererBackend;
 
 const DEFAULT_DEPTH_MAX_DISTANCE: f32 = 6.0;
-const DEFAULT_OUTPUT_PATH: &str = "margaret-m2a-normals.ppm";
+const DEFAULT_OUTPUT_PATH: &str = "margaret-m2b-normals.ppm";
 
 pub fn run() -> std::io::Result<()> {
     run_from_args(env::args_os())
@@ -29,7 +29,7 @@ where
 
     let scene = hardcoded_scene();
     let backend = CpuRendererBackend::new();
-    let metadata = backend.describe_render(&scene, config.image_size);
+    let metadata = backend.describe_render(&scene, config.image_size, config.render_settings);
     let image = backend.render(&scene, config.image_size, config.render_settings);
 
     if let Some(parent) = config.output_path.parent() {
@@ -40,7 +40,7 @@ where
 
     image.write_ppm(&config.output_path)?;
 
-    println!("Margaret M2a CPU direct-light render");
+    println!("Margaret M2b CPU diffuse path trace");
     println!("scene: {}", metadata.scene_name);
     println!("backend: {}", metadata.backend_name);
     println!("mode: {}", config.render_settings.mode.as_str());
@@ -105,7 +105,7 @@ impl CliConfig {
                     config.render_settings.mode = render_mode;
                     if config.output_path == Path::new(DEFAULT_OUTPUT_PATH) {
                         config.output_path = PathBuf::from(format!(
-                            "margaret-m2a-{}.ppm",
+                            "margaret-m2b-{}.ppm",
                             config.render_settings.mode.as_str()
                         ));
                     }
@@ -196,7 +196,7 @@ fn hardcoded_scene() -> SceneDescription {
     let white = MaterialId(2);
     let light = MaterialId(3);
 
-    let mut scene = SceneDescription::new("m2a-hardcoded-lit-scene", camera);
+    let mut scene = SceneDescription::new("m2b-hardcoded-path-scene", camera);
     scene.materials.push(MaterialDescription::new(
         red,
         "red",
@@ -370,7 +370,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.render_settings.mode, RenderMode::Lit);
-        assert_eq!(config.output_path, PathBuf::from("margaret-m2a-lit.ppm"));
+        assert_eq!(config.output_path, PathBuf::from("margaret-m2b-lit.ppm"));
     }
 
     #[test]
@@ -398,7 +398,7 @@ mod tests {
             config.render_settings.mode,
             RenderMode::Debug(RenderDebugMode::Depth)
         );
-        assert_eq!(config.output_path, PathBuf::from("margaret-m2a-depth.ppm"));
+        assert_eq!(config.output_path, PathBuf::from("margaret-m2b-depth.ppm"));
     }
 
     #[test]
