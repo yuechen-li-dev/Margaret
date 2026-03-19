@@ -80,6 +80,7 @@ struct SceneHit {
     pub distance: f32,
     pub position: Point3,
     pub normal: Vec3,
+    pub front_face: bool,
     pub material_id: MaterialId,
 }
 
@@ -134,7 +135,7 @@ fn shade_lit(
 ) -> ColorRgb {
     let material =
         find_material(scene, hit.material_id).expect("scene hit referenced a missing material");
-    let mut radiance = material.emissive_radiance();
+    let mut radiance = visible_emissive_radiance(material, hit.front_face);
 
     if material.is_emissive() {
         return radiance;
@@ -149,12 +150,25 @@ fn shade_lit(
     radiance
 }
 
+fn visible_emissive_radiance(material: &MaterialDescription, front_face: bool) -> ColorRgb {
+    if !material.is_emissive() {
+        return ColorRgb::BLACK;
+    }
+
+    if front_face {
+        material.emissive_radiance()
+    } else {
+        ColorRgb::BLACK
+    }
+}
+
 fn evaluate_direct_light(
     scene: &SceneDescription,
     hit: &SceneHit,
     albedo: ColorRgb,
     light: &EmissiveTriangle,
 ) -> ColorRgb {
+    // M2a uses one centroid sample per emissive triangle and weights it by area.
     let light_position = light.triangle.centroid();
     let to_light = light_position - hit.position;
     let distance_squared = to_light.length_squared();
@@ -198,6 +212,7 @@ fn closest_hit(scene: &SceneDescription, ray: Ray) -> Option<SceneHit> {
         distance: hit.distance,
         position: hit.position,
         normal: hit.normal,
+        front_face: hit.front_face,
         material_id: hit.material_id,
     })
 }
@@ -207,6 +222,7 @@ struct TraceHit {
     pub distance: f32,
     pub position: Point3,
     pub normal: Vec3,
+    pub front_face: bool,
     pub material_id: MaterialId,
 }
 
@@ -225,6 +241,7 @@ fn trace_hit(scene: &SceneDescription, ray: Ray, t_min: f32, t_max: f32) -> Opti
                             distance: hit.distance,
                             position: hit.position,
                             normal: hit.normal,
+                            front_face: hit.front_face,
                             material_id: object.material_id,
                         });
                     }
@@ -298,11 +315,13 @@ fn intersect_triangle(ray: Ray, triangle: &Triangle, t_min: f32, t_max: f32) -> 
     }
 
     let normal = triangle.geometric_normal();
+    let front_face = ray.direction.dot(normal) < 0.0;
 
     Some(HitRecord {
         distance,
         position: ray.at(distance),
         normal,
+        front_face,
         triangle_index: 0,
     })
 }
@@ -393,6 +412,7 @@ mod tests {
         let hit = intersect_triangle(ray, &triangle, MIN_HIT_DISTANCE, f32::INFINITY).unwrap();
 
         assert_eq!(hit.normal, Vec3::new(0.0, 0.0, 1.0));
+        assert!(!hit.front_face);
     }
 
     #[test]
@@ -463,17 +483,20 @@ mod tests {
 
     #[test]
     fn lit_mode_receives_emissive_triangle_contribution() {
-        let backend = CpuRendererBackend::new();
-        let image = backend.render(
-            &simple_lighting_scene(false),
-            ImageSize::new(5, 5),
-            RenderSettings::new(RenderMode::Lit, 6.0),
-        );
+        let scene = simple_lighting_scene(false);
+        let hit = SceneHit {
+            distance: 3.0,
+            position: Point3::new(0.0, 0.0, 0.0),
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            front_face: true,
+            material_id: MaterialId(0),
+        };
+        let lights = super::collect_emissive_triangles(&scene);
+        let color = super::shade_lit(&scene, &hit, &lights);
 
-        let center = image.get_pixel(2, 2);
-        assert!(center.r > 0);
-        assert!(center.g > 0);
-        assert!(center.b > 0);
+        assert!(color.r > 0.0);
+        assert!(color.g > 0.0);
+        assert!(color.b > 0.0);
     }
 
     #[test]
@@ -484,6 +507,7 @@ mod tests {
             distance: 3.0,
             position: Point3::new(0.0, 0.0, 0.0),
             normal: Vec3::new(0.0, 0.0, 1.0),
+            front_face: true,
             material_id: MaterialId(0),
         };
 
@@ -508,6 +532,61 @@ mod tests {
 
         let center = image.get_pixel(2, 2);
         assert_eq!(center, ColorRgba8::new(255, 242, 191, 255));
+    }
+
+    #[test]
+    fn lit_mode_hides_emissive_backfaces() {
+        let backend = CpuRendererBackend::new();
+        let image = backend.render(
+            &emissive_backface_scene(),
+            ImageSize::new(5, 5),
+            RenderSettings::new(RenderMode::Lit, 6.0),
+        );
+
+        assert_eq!(image.get_pixel(2, 2), ColorRgba8::new(0, 0, 0, 255));
+    }
+
+    #[test]
+    fn backfacing_emissive_triangle_does_not_contribute_direct_light() {
+        let hit = SceneHit {
+            distance: 3.0,
+            position: Point3::new(0.0, 0.0, 0.0),
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            front_face: true,
+            material_id: MaterialId(0),
+        };
+
+        let front_facing_scene = simple_lighting_scene(false);
+        let back_facing_scene = simple_lighting_scene_with_light_winding(false);
+        let front_facing_lights = super::collect_emissive_triangles(&front_facing_scene);
+        let back_facing_lights = super::collect_emissive_triangles(&back_facing_scene);
+        let front_facing_color = super::shade_lit(&front_facing_scene, &hit, &front_facing_lights);
+        let back_facing_color = super::shade_lit(&back_facing_scene, &hit, &back_facing_lights);
+
+        assert!(front_facing_color.r > 0.0);
+        assert_eq!(back_facing_color, ColorRgb::BLACK);
+    }
+
+    #[test]
+    fn centroid_sampled_direct_light_scales_with_emitter_area() {
+        let hit = SceneHit {
+            distance: 3.0,
+            position: Point3::new(0.0, 0.0, 0.0),
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            front_face: true,
+            material_id: MaterialId(0),
+        };
+
+        let small_light_scene = simple_lighting_scene_with_light_half_extent(0.2);
+        let large_light_scene = simple_lighting_scene_with_light_half_extent(0.4);
+        let small_lights = super::collect_emissive_triangles(&small_light_scene);
+        let large_lights = super::collect_emissive_triangles(&large_light_scene);
+        let small_color = super::shade_lit(&small_light_scene, &hit, &small_lights);
+        let large_color = super::shade_lit(&large_light_scene, &hit, &large_lights);
+
+        assert!(large_color.r > small_color.r);
+        assert!(large_color.g > small_color.g);
+        assert!(large_color.b > small_color.b);
     }
 
     #[test]
@@ -589,6 +668,39 @@ mod tests {
         scene
     }
 
+    fn emissive_backface_scene() -> SceneDescription {
+        let camera = Camera::new(
+            "main",
+            Point3::new(0.0, 0.0, -3.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::Y,
+            45.0,
+        );
+        let emissive = MaterialId(0);
+
+        let mut scene = SceneDescription::new("emissive-backface", camera);
+        scene.materials.push(MaterialDescription::new(
+            emissive,
+            "light",
+            MaterialKind::Diffuse {
+                albedo: ColorRgb::BLACK,
+                emission: ColorRgb::new(1.0, 0.95, 0.75),
+            },
+        ));
+        scene.objects.push(SceneObject::new(
+            "light",
+            Geometry::TriangleMesh {
+                triangles: vec![Triangle::new(
+                    Point3::new(-0.5, -0.5, 0.0),
+                    Point3::new(0.5, -0.5, 0.0),
+                    Point3::new(0.0, 0.5, 0.0),
+                )],
+            },
+            emissive,
+        ));
+        scene
+    }
+
     fn single_triangle_scene() -> SceneDescription {
         let camera = Camera::new(
             "main",
@@ -623,6 +735,22 @@ mod tests {
     }
 
     fn simple_lighting_scene(with_occluder: bool) -> SceneDescription {
+        simple_lighting_scene_with_light_winding_and_extent(with_occluder, true, 0.35)
+    }
+
+    fn simple_lighting_scene_with_light_winding(front_facing: bool) -> SceneDescription {
+        simple_lighting_scene_with_light_winding_and_extent(false, front_facing, 0.35)
+    }
+
+    fn simple_lighting_scene_with_light_half_extent(light_half_extent: f32) -> SceneDescription {
+        simple_lighting_scene_with_light_winding_and_extent(false, true, light_half_extent)
+    }
+
+    fn simple_lighting_scene_with_light_winding_and_extent(
+        with_occluder: bool,
+        front_facing_light: bool,
+        light_half_extent: f32,
+    ) -> SceneDescription {
         let camera = Camera::new(
             "main",
             Point3::new(0.0, 0.0, 3.0),
@@ -681,18 +809,7 @@ mod tests {
         scene.objects.push(SceneObject::new(
             "light",
             Geometry::TriangleMesh {
-                triangles: vec![
-                    Triangle::new(
-                        Point3::new(-0.35, -0.35, 1.5),
-                        Point3::new(0.35, 0.35, 1.5),
-                        Point3::new(0.35, -0.35, 1.5),
-                    ),
-                    Triangle::new(
-                        Point3::new(-0.35, -0.35, 1.5),
-                        Point3::new(-0.35, 0.35, 1.5),
-                        Point3::new(0.35, 0.35, 1.5),
-                    ),
-                ],
+                triangles: make_light_triangles(light_half_extent, front_facing_light),
             },
             emissive,
         ));
@@ -719,6 +836,25 @@ mod tests {
         }
 
         scene
+    }
+
+    fn make_light_triangles(light_half_extent: f32, front_facing_light: bool) -> Vec<Triangle> {
+        let bottom_left = Point3::new(-light_half_extent, -light_half_extent, 1.5);
+        let bottom_right = Point3::new(light_half_extent, -light_half_extent, 1.5);
+        let top_left = Point3::new(-light_half_extent, light_half_extent, 1.5);
+        let top_right = Point3::new(light_half_extent, light_half_extent, 1.5);
+
+        if front_facing_light {
+            vec![
+                Triangle::new(bottom_left, top_right, bottom_right),
+                Triangle::new(bottom_left, top_left, top_right),
+            ]
+        } else {
+            vec![
+                Triangle::new(bottom_left, bottom_right, top_right),
+                Triangle::new(bottom_left, top_right, top_left),
+            ]
+        }
     }
 
     fn lit_room_scene() -> SceneDescription {
