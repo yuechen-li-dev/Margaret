@@ -20,6 +20,7 @@ name = "margaret-cpu"
 version = "0.1.0"
 dependencies = [
  "margaret-core",
+ "margaret-image",
  "margaret-testutil",
 ]
 

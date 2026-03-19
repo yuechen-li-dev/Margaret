@@ -1,7 +1,7 @@
 use crate::camera::Camera;
 use crate::light::Light;
 use crate::material::{MaterialDescription, MaterialId};
-use crate::math::Point3;
+use crate::math::{Point3, Vec3};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SceneDescription {
@@ -43,5 +43,24 @@ impl SceneObject {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Geometry {
-    Sphere { center: Point3, radius: f32 },
+    TriangleMesh { triangles: Vec<Triangle> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Triangle {
+    pub vertices: [Point3; 3],
+}
+
+impl Triangle {
+    pub const fn new(a: Point3, b: Point3, c: Point3) -> Self {
+        Self {
+            vertices: [a, b, c],
+        }
+    }
+
+    pub fn geometric_normal(&self) -> Vec3 {
+        let edge_ab = self.vertices[1] - self.vertices[0];
+        let edge_ac = self.vertices[2] - self.vertices[0];
+        edge_ab.cross(edge_ac).normalized()
+    }
 }

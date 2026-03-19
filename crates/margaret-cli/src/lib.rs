@@ -1,21 +1,23 @@
+use std::path::Path;
+
 use margaret_core::camera::Camera;
-use margaret_core::color::ColorRgb;
 use margaret_core::image::ImageSize;
-use margaret_core::light::Light;
 use margaret_core::material::{MaterialDescription, MaterialId, MaterialKind};
 use margaret_core::math::{Point3, Vec3};
-use margaret_core::scene::{Geometry, SceneDescription, SceneObject};
+use margaret_core::scene::{Geometry, SceneDescription, SceneObject, Triangle};
 use margaret_cpu::CpuRendererBackend;
-use margaret_image::placeholder_image;
 
-pub fn run() {
-    let scene = placeholder_scene();
-    let image_size = ImageSize::new(800, 600);
+pub fn run() -> std::io::Result<()> {
+    let scene = hardcoded_scene();
+    let image_size = ImageSize::new(320, 200);
     let backend = CpuRendererBackend::new();
     let metadata = backend.describe_render(&scene, image_size);
-    let image = placeholder_image(&metadata);
+    let image = backend.render(&scene, image_size);
+    let output_path = Path::new("margaret-m1a.ppm");
 
-    println!("Margaret M0 scaffold");
+    image.write_ppm(output_path)?;
+
+    println!("Margaret M1a CPU triangle render");
     println!("scene: {}", metadata.scene_name);
     println!("backend: {}", metadata.backend_name);
     println!(
@@ -25,51 +27,63 @@ pub fn run() {
     println!("samples: {}", metadata.sample_count);
     println!("objects: {}", metadata.object_count);
     println!("lights: {}", metadata.light_count);
-    println!("placeholder pixels: {}", image.pixels.len());
+    println!("output: {}", output_path.display());
+
+    Ok(())
 }
 
-fn placeholder_scene() -> SceneDescription {
+fn hardcoded_scene() -> SceneDescription {
     let camera = Camera::new(
         "main-camera",
-        Point3::new(0.0, 1.5, 5.0),
+        Point3::new(0.0, 0.0, 2.5),
         Vec3::new(0.0, 0.0, -1.0),
         Vec3::Y,
         45.0,
     );
     let material_id = MaterialId(0);
 
-    let mut scene = SceneDescription::new("m0-placeholder-scene", camera);
+    let mut scene = SceneDescription::new("m1a-hardcoded-triangle-scene", camera);
     scene.materials.push(MaterialDescription::new(
         material_id,
-        "ground",
+        "debug-normals",
         MaterialKind::Diffuse {
-            albedo: ColorRgb::new(0.7, 0.7, 0.7),
+            albedo: margaret_core::color::ColorRgb::WHITE,
         },
     ));
     scene.objects.push(SceneObject::new(
-        "hero-sphere",
-        Geometry::Sphere {
-            center: Point3::ORIGIN,
-            radius: 1.0,
+        "two-triangle-test-mesh",
+        Geometry::TriangleMesh {
+            triangles: vec![
+                Triangle::new(
+                    Point3::new(-0.9, -0.8, 0.0),
+                    Point3::new(0.0, 0.9, 0.1),
+                    Point3::new(0.9, -0.7, -0.2),
+                ),
+                Triangle::new(
+                    Point3::new(-1.1, -0.9, -0.8),
+                    Point3::new(1.0, -0.9, -0.8),
+                    Point3::new(0.0, -0.2, 0.3),
+                ),
+            ],
         },
         material_id,
     ));
-    scene.lights.push(Light::Directional {
-        direction: Vec3::new(-0.5, -1.0, -0.25),
-        intensity: ColorRgb::WHITE,
-    });
     scene
 }
 
 #[cfg(test)]
 mod tests {
-    use super::placeholder_scene;
+    use super::hardcoded_scene;
+    use margaret_core::scene::Geometry;
 
     #[test]
-    fn placeholder_scene_contains_one_object() {
-        let scene = placeholder_scene();
+    fn hardcoded_scene_contains_triangle_mesh() {
+        let scene = hardcoded_scene();
 
         assert_eq!(scene.objects.len(), 1);
-        assert_eq!(scene.lights.len(), 1);
+        assert_eq!(scene.lights.len(), 0);
+        match &scene.objects[0].geometry {
+            Geometry::TriangleMesh { triangles } => assert_eq!(triangles.len(), 2),
+        }
     }
 }
