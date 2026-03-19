@@ -1,12 +1,13 @@
 use margaret_core::color::{ColorRgb, ColorRgba8};
 use margaret_core::image::{ImageSize, OutputPixelFormat, RenderMetadata};
-use margaret_core::material::{MaterialDescription, MaterialId};
+use margaret_core::material::{MaterialDescription, MaterialId, MaterialKind};
 use margaret_core::math::{Point3, Vec3};
 use margaret_core::ray::{HitRecord, Ray};
 use margaret_core::render::{RenderDebugMode, RenderMode, RenderSettings};
 use margaret_core::scene::{Geometry, SceneDescription, Triangle};
 use margaret_image::OwnedImage;
 
+const AIR_REFRACTIVE_INDEX: f32 = 1.0;
 const DETERMINANT_EPSILON: f32 = 0.000_1;
 const MIN_HIT_DISTANCE: f32 = 0.000_1;
 const SHADOW_BIAS: f32 = 0.001;
@@ -14,7 +15,7 @@ const MISS_COLOR: ColorRgba8 = ColorRgba8::new(18, 24, 32, 255);
 const DEPTH_MISS_COLOR: ColorRgba8 = ColorRgba8::new(0, 0, 0, 255);
 const INV_PI: f32 = 0.318_309_87;
 const LIT_SAMPLES_PER_PIXEL: u32 = 16;
-const MAX_PATH_VERTICES: u32 = 3;
+const MAX_PATH_VERTICES: u32 = 4;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CpuRendererBackend;
@@ -101,7 +102,14 @@ fn render_lit_pixel(
             rng.next_f32(),
             rng.next_f32(),
         );
-        radiance += trace_diffuse_path(scene, ray, emissive_triangles, &mut rng);
+        radiance += trace_lit_path(
+            scene,
+            ray,
+            emissive_triangles,
+            &mut rng,
+            MAX_PATH_VERTICES,
+            true,
+        );
     }
 
     let average_radiance = radiance * (1.0 / LIT_SAMPLES_PER_PIXEL as f32);
@@ -157,6 +165,23 @@ impl PixelRng {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PathEvent {
+    Diffuse {
+        albedo: ColorRgb,
+        bounce_ray: Ray,
+    },
+    SpecularReflection {
+        reflectance: ColorRgb,
+        bounce_ray: Ray,
+    },
+    Dielectric {
+        fresnel_reflectance: f32,
+        reflected_ray: Ray,
+        refracted_ray: Option<Ray>,
+    },
+}
+
 fn shade_hit(
     scene: &SceneDescription,
     render_settings: RenderSettings,
@@ -204,67 +229,186 @@ fn shade_lit(
         find_material(scene, hit.material_id).expect("scene hit referenced a missing material");
     let mut radiance = visible_emissive_radiance(material, hit.front_face);
 
+    let MaterialKind::Diffuse { albedo, .. } = material.kind else {
+        return radiance;
+    };
+
     if material.is_emissive() {
         return radiance;
     }
 
-    let albedo = material.diffuse_albedo();
-
+    let direct_normal = scatter_normal(hit);
     for light in emissive_triangles {
-        radiance += evaluate_direct_light(scene, hit, albedo, light);
+        radiance += evaluate_direct_light(scene, hit.position, direct_normal, albedo, light);
     }
 
     radiance
 }
 
-fn trace_diffuse_path(
+fn trace_lit_path(
     scene: &SceneDescription,
-    initial_ray: Ray,
+    ray: Ray,
     emissive_triangles: &[EmissiveTriangle],
     rng: &mut PixelRng,
+    remaining_vertices: u32,
+    allow_emissive_hit: bool,
 ) -> ColorRgb {
-    let mut ray = initial_ray;
-    let mut throughput = ColorRgb::WHITE;
-    let mut radiance = ColorRgb::BLACK;
-
-    for path_vertex_index in 0..MAX_PATH_VERTICES {
-        let Some(hit) = closest_hit(scene, ray) else {
-            break;
-        };
-
-        let material =
-            find_material(scene, hit.material_id).expect("scene hit referenced a missing material");
-        if path_vertex_index == 0 {
-            radiance += throughput * visible_emissive_radiance(material, hit.front_face);
-        }
-
-        if material.is_emissive() {
-            break;
-        }
-
-        let albedo = material.diffuse_albedo();
-        for light in emissive_triangles {
-            radiance += throughput * evaluate_direct_light(scene, &hit, albedo, light);
-        }
-
-        // With Lambertian BRDF f = albedo / pi and cosine-weighted hemisphere
-        // sampling pdf = cos(theta) / pi, the throughput factor f * cos / pdf
-        // reduces to multiplying by albedo.
-        throughput = throughput * albedo;
-        if is_black(throughput) {
-            break;
-        }
-
-        let bounce_direction = sample_cosine_weighted_hemisphere(hit.normal, rng);
-        let bounce_origin = hit.position + hit.normal * SHADOW_BIAS;
-        ray = Ray::new(bounce_origin, bounce_direction);
+    if remaining_vertices == 0 {
+        return ColorRgb::BLACK;
     }
 
-    radiance
+    let Some(hit) = closest_hit(scene, ray) else {
+        return ColorRgb::BLACK;
+    };
+
+    let material =
+        find_material(scene, hit.material_id).expect("scene hit referenced a missing material");
+    let emitted = if allow_emissive_hit {
+        visible_emissive_radiance(material, hit.front_face)
+    } else {
+        ColorRgb::BLACK
+    };
+
+    if material.is_emissive() {
+        return emitted;
+    }
+
+    let event = build_path_event(material, ray, &hit, rng);
+    let next_remaining_vertices = remaining_vertices - 1;
+
+    match event {
+        PathEvent::Diffuse { albedo, bounce_ray } => {
+            let mut radiance = emitted;
+            let direct_normal = scatter_normal(&hit);
+
+            for light in emissive_triangles {
+                radiance +=
+                    evaluate_direct_light(scene, hit.position, direct_normal, albedo, light);
+            }
+
+            let indirect = trace_lit_path(
+                scene,
+                bounce_ray,
+                emissive_triangles,
+                rng,
+                next_remaining_vertices,
+                false,
+            );
+
+            radiance + albedo * indirect
+        }
+        PathEvent::SpecularReflection {
+            reflectance,
+            bounce_ray,
+        } => {
+            emitted
+                + reflectance
+                    * trace_lit_path(
+                        scene,
+                        bounce_ray,
+                        emissive_triangles,
+                        rng,
+                        next_remaining_vertices,
+                        true,
+                    )
+        }
+        PathEvent::Dielectric {
+            fresnel_reflectance,
+            reflected_ray,
+            refracted_ray,
+        } => {
+            let reflected = trace_lit_path(
+                scene,
+                reflected_ray,
+                emissive_triangles,
+                rng,
+                next_remaining_vertices,
+                true,
+            ) * fresnel_reflectance;
+
+            let transmitted = match refracted_ray {
+                Some(ray) => {
+                    trace_lit_path(
+                        scene,
+                        ray,
+                        emissive_triangles,
+                        rng,
+                        next_remaining_vertices,
+                        true,
+                    ) * (1.0 - fresnel_reflectance)
+                }
+                None => ColorRgb::BLACK,
+            };
+
+            emitted + reflected + transmitted
+        }
+    }
 }
 
-fn is_black(color: ColorRgb) -> bool {
-    color == ColorRgb::BLACK
+fn build_path_event(
+    material: &MaterialDescription,
+    incoming_ray: Ray,
+    hit: &SceneHit,
+    rng: &mut PixelRng,
+) -> PathEvent {
+    match material.kind {
+        MaterialKind::Diffuse { albedo, .. } => {
+            let bounce_normal = scatter_normal(hit);
+            let bounce_direction = sample_cosine_weighted_hemisphere(bounce_normal, rng);
+            let bounce_origin = offset_ray_origin(hit.position, hit.normal, bounce_direction);
+
+            PathEvent::Diffuse {
+                albedo,
+                bounce_ray: Ray::new(bounce_origin, bounce_direction),
+            }
+        }
+        MaterialKind::SpecularReflector { reflectance } => {
+            let bounce_normal = scatter_normal(hit);
+            let reflected_direction = reflect(incoming_ray.direction.normalized(), bounce_normal);
+            let bounce_origin = offset_ray_origin(hit.position, hit.normal, reflected_direction);
+
+            PathEvent::SpecularReflection {
+                reflectance,
+                bounce_ray: Ray::new(bounce_origin, reflected_direction),
+            }
+        }
+        MaterialKind::Dielectric { refractive_index } => {
+            build_dielectric_event(incoming_ray, hit, refractive_index)
+        }
+    }
+}
+
+fn build_dielectric_event(incoming_ray: Ray, hit: &SceneHit, refractive_index: f32) -> PathEvent {
+    let surface_normal = scatter_normal(hit);
+    let unit_direction = incoming_ray.direction.normalized();
+    let reflected_direction = reflect(unit_direction, surface_normal);
+    let reflected_origin = offset_ray_origin(hit.position, hit.normal, reflected_direction);
+    let (incident_index, transmitted_index) = if hit.front_face {
+        (AIR_REFRACTIVE_INDEX, refractive_index)
+    } else {
+        (refractive_index, AIR_REFRACTIVE_INDEX)
+    };
+    let eta = incident_index / transmitted_index;
+    let cosine = (-unit_direction).dot(surface_normal).clamp(0.0, 1.0);
+    let sin_theta_squared = (1.0 - cosine * cosine).max(0.0);
+
+    if eta * eta * sin_theta_squared > 1.0 {
+        return PathEvent::Dielectric {
+            fresnel_reflectance: 1.0,
+            reflected_ray: Ray::new(reflected_origin, reflected_direction),
+            refracted_ray: None,
+        };
+    }
+
+    let fresnel_reflectance = schlick_fresnel(cosine, incident_index, transmitted_index);
+    let refracted_direction = refract(unit_direction, surface_normal, eta);
+    let refracted_origin = offset_ray_origin(hit.position, hit.normal, refracted_direction);
+
+    PathEvent::Dielectric {
+        fresnel_reflectance,
+        reflected_ray: Ray::new(reflected_origin, reflected_direction),
+        refracted_ray: Some(Ray::new(refracted_origin, refracted_direction)),
+    }
 }
 
 fn sample_cosine_weighted_hemisphere(normal: Vec3, rng: &mut PixelRng) -> Vec3 {
@@ -294,6 +438,40 @@ fn build_tangent(normal: Vec3) -> Vec3 {
     normal.cross(reference).normalized()
 }
 
+fn reflect(direction: Vec3, normal: Vec3) -> Vec3 {
+    (direction - normal * (2.0 * direction.dot(normal))).normalized()
+}
+
+fn refract(direction: Vec3, normal: Vec3, eta: f32) -> Vec3 {
+    let cosine = (-direction).dot(normal).clamp(0.0, 1.0);
+    let perpendicular = (direction + normal * cosine) * eta;
+    let parallel = normal * -(1.0 - perpendicular.length_squared()).max(0.0).sqrt();
+
+    (perpendicular + parallel).normalized()
+}
+
+fn schlick_fresnel(cosine: f32, incident_index: f32, transmitted_index: f32) -> f32 {
+    let ratio = (incident_index - transmitted_index) / (incident_index + transmitted_index);
+    let reflectance_at_normal = ratio * ratio;
+    reflectance_at_normal + (1.0 - reflectance_at_normal) * (1.0 - cosine).powi(5)
+}
+
+fn scatter_normal(hit: &SceneHit) -> Vec3 {
+    if hit.front_face {
+        hit.normal
+    } else {
+        -hit.normal
+    }
+}
+
+fn offset_ray_origin(position: Point3, geometric_normal: Vec3, direction: Vec3) -> Point3 {
+    if direction.dot(geometric_normal) >= 0.0 {
+        position + geometric_normal * SHADOW_BIAS
+    } else {
+        position - geometric_normal * SHADOW_BIAS
+    }
+}
+
 fn visible_emissive_radiance(material: &MaterialDescription, front_face: bool) -> ColorRgb {
     if !material.is_emissive() {
         return ColorRgb::BLACK;
@@ -308,19 +486,20 @@ fn visible_emissive_radiance(material: &MaterialDescription, front_face: bool) -
 
 fn evaluate_direct_light(
     scene: &SceneDescription,
-    hit: &SceneHit,
+    hit_position: Point3,
+    hit_normal: Vec3,
     albedo: ColorRgb,
     light: &EmissiveTriangle,
 ) -> ColorRgb {
     let light_position = light.triangle.centroid();
-    let to_light = light_position - hit.position;
+    let to_light = light_position - hit_position;
     let distance_squared = to_light.length_squared();
     if distance_squared <= SHADOW_BIAS * SHADOW_BIAS {
         return ColorRgb::BLACK;
     }
 
     let light_direction = to_light.normalized();
-    let surface_cosine = hit.normal.dot(light_direction);
+    let surface_cosine = hit_normal.dot(light_direction);
     if surface_cosine <= 0.0 {
         return ColorRgb::BLACK;
     }
@@ -331,7 +510,7 @@ fn evaluate_direct_light(
         return ColorRgb::BLACK;
     }
 
-    let shadow_origin = hit.position + hit.normal * SHADOW_BIAS;
+    let shadow_origin = offset_ray_origin(hit_position, hit_normal, light_direction);
     let shadow_distance = (light_position - shadow_origin).length();
     let shadow_ray = Ray::new(shadow_origin, light_direction);
 
@@ -490,10 +669,10 @@ fn to_u8(value: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        closest_hit, color_rgb_to_rgba8, find_material, intersect_triangle, miss_color,
-        sample_cosine_weighted_hemisphere, trace_diffuse_path, CpuRendererBackend, PixelRng,
-        SceneHit, DEPTH_MISS_COLOR, LIT_SAMPLES_PER_PIXEL, MAX_PATH_VERTICES, MIN_HIT_DISTANCE,
-        MISS_COLOR,
+        build_dielectric_event, build_path_event, closest_hit, color_rgb_to_rgba8, find_material,
+        intersect_triangle, miss_color, reflect, sample_cosine_weighted_hemisphere,
+        schlick_fresnel, trace_lit_path, CpuRendererBackend, PathEvent, PixelRng, SceneHit,
+        DEPTH_MISS_COLOR, LIT_SAMPLES_PER_PIXEL, MAX_PATH_VERTICES, MIN_HIT_DISTANCE, MISS_COLOR,
     };
     use margaret_core::camera::Camera;
     use margaret_core::color::{ColorRgb, ColorRgba8};
@@ -518,7 +697,7 @@ mod tests {
         assert_eq!(metadata.object_count, 7);
         assert_eq!(metadata.light_count, 2);
         assert_eq!(metadata.sample_count, LIT_SAMPLES_PER_PIXEL);
-        assert_eq!(MAX_PATH_VERTICES, 3);
+        assert_eq!(MAX_PATH_VERTICES, 4);
     }
 
     #[test]
@@ -679,7 +858,7 @@ mod tests {
         let ray = Ray::new(Point3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 0.0, -1.0));
         let mut rng = PixelRng::new(1, 2);
 
-        let color = trace_diffuse_path(&scene, ray, &lights, &mut rng);
+        let color = trace_lit_path(&scene, ray, &lights, &mut rng, MAX_PATH_VERTICES, true);
 
         assert!(color.r > 0.0);
         assert!(color.g > 0.0);
@@ -693,7 +872,7 @@ mod tests {
         let ray = Ray::new(Point3::new(0.0, 0.0, -1.0), Vec3::new(0.0, 0.0, 1.0));
         let mut rng = PixelRng::new(3, 4);
 
-        let color = trace_diffuse_path(&scene, ray, &lights, &mut rng);
+        let color = trace_lit_path(&scene, ray, &lights, &mut rng, MAX_PATH_VERTICES, true);
 
         assert_eq!(color, ColorRgb::BLACK);
     }
@@ -724,7 +903,7 @@ mod tests {
         let mut color = ColorRgb::BLACK;
 
         for _sample_index in 0..256 {
-            color += trace_diffuse_path(&scene, ray, &lights, &mut rng);
+            color += trace_lit_path(&scene, ray, &lights, &mut rng, MAX_PATH_VERTICES, true);
         }
 
         assert!(color.r > 0.0);
@@ -747,9 +926,130 @@ mod tests {
         let expected_direct = super::shade_lit(&scene, &hit, &lights);
         let mut rng = PixelRng::new(5, 6);
 
-        let color = trace_diffuse_path(&scene, ray, &lights, &mut rng);
+        let color = trace_lit_path(&scene, ray, &lights, &mut rng, MAX_PATH_VERTICES, true);
 
         assert_color_near(color, expected_direct, 0.0001);
+    }
+
+    #[test]
+    fn mirror_path_sees_emitter_after_reflection() {
+        let scene = mirror_reflection_scene();
+        let lights = super::collect_emissive_triangles(&scene);
+        let ray = Ray::new(Point3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 0.0, -1.0));
+        let mut rng = PixelRng::new(8, 9);
+
+        let color = trace_lit_path(&scene, ray, &lights, &mut rng, MAX_PATH_VERTICES, true);
+
+        assert!(color.r > 0.0);
+        assert!(color.g > 0.0);
+        assert!(color.b > 0.0);
+    }
+
+    #[test]
+    fn mirror_does_not_receive_diffuse_direct_light_estimate() {
+        let scene = mirror_direct_light_regression_scene();
+        let lights = super::collect_emissive_triangles(&scene);
+        let ray = Ray::new(Point3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 0.0, -1.0));
+        let mut rng = PixelRng::new(10, 11);
+
+        let color = trace_lit_path(&scene, ray, &lights, &mut rng, MAX_PATH_VERTICES, true);
+
+        assert_eq!(color, ColorRgb::BLACK);
+    }
+
+    #[test]
+    fn dielectric_path_transmits_emitter_at_normal_incidence() {
+        let scene = glass_transmission_scene();
+        let lights = super::collect_emissive_triangles(&scene);
+        let ray = Ray::new(Point3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 0.0, -1.0));
+        let mut rng = PixelRng::new(12, 13);
+
+        let color = trace_lit_path(&scene, ray, &lights, &mut rng, MAX_PATH_VERTICES, true);
+
+        assert!(color.r > 0.0);
+        assert!(color.g > 0.0);
+        assert!(color.b > 0.0);
+    }
+
+    #[test]
+    fn dielectric_total_internal_reflection_returns_reflection_only() {
+        let hit = SceneHit {
+            distance: 1.0,
+            position: Point3::ORIGIN,
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            front_face: false,
+            material_id: MaterialId(0),
+        };
+        let ray = Ray::new(
+            Point3::new(0.0, 0.0, -0.5),
+            Vec3::new(0.9, 0.0, 0.435_889_9).normalized(),
+        );
+
+        let event = build_dielectric_event(ray, &hit, 1.5);
+
+        let PathEvent::Dielectric {
+            fresnel_reflectance,
+            refracted_ray,
+            ..
+        } = event
+        else {
+            panic!("expected dielectric event");
+        };
+
+        assert_eq!(fresnel_reflectance, 1.0);
+        assert!(refracted_ray.is_none());
+    }
+
+    #[test]
+    fn build_path_event_reflects_mirror_direction() {
+        let material = MaterialDescription::new(
+            MaterialId(0),
+            "mirror",
+            MaterialKind::SpecularReflector {
+                reflectance: ColorRgb::WHITE,
+            },
+        );
+        let ray = Ray::new(
+            Point3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.0, -1.0, -1.0).normalized(),
+        );
+        let hit = SceneHit {
+            distance: 1.0,
+            position: Point3::ORIGIN,
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            front_face: true,
+            material_id: MaterialId(0),
+        };
+        let mut rng = PixelRng::new(0, 0);
+
+        let event = build_path_event(&material, ray, &hit, &mut rng);
+
+        let PathEvent::SpecularReflection { bounce_ray, .. } = event else {
+            panic!("expected mirror event");
+        };
+
+        assert_vec3_near(
+            bounce_ray.direction,
+            Vec3::new(0.0, -1.0, 1.0).normalized(),
+            0.000_001,
+        );
+    }
+
+    #[test]
+    fn schlick_fresnel_increases_toward_grazing_angles() {
+        let near_normal = schlick_fresnel(1.0, 1.0, 1.5);
+        let grazing = schlick_fresnel(0.1, 1.0, 1.5);
+
+        assert!(grazing > near_normal);
+    }
+
+    #[test]
+    fn reflect_flips_direction_about_surface_normal() {
+        let direction = Vec3::new(0.0, -1.0, -1.0).normalized();
+        let normal = Vec3::new(0.0, 0.0, 1.0);
+        let reflected = reflect(direction, normal);
+
+        assert_vec3_near(reflected, Vec3::new(0.0, -1.0, 1.0).normalized(), 0.000_001);
     }
 
     #[test]
@@ -797,13 +1097,11 @@ mod tests {
         let material_id = MaterialId(0);
 
         let mut scene = SceneDescription::new("single-triangle", camera);
-        scene.materials.push(MaterialDescription::new(
+        scene.materials.push(make_diffuse(
             material_id,
             "gray",
-            MaterialKind::Diffuse {
-                albedo: ColorRgb::new(0.6, 0.6, 0.6),
-                emission: ColorRgb::BLACK,
-            },
+            ColorRgb::new(0.6, 0.6, 0.6),
+            ColorRgb::BLACK,
         ));
         scene.objects.push(SceneObject::new(
             "triangle",
@@ -831,13 +1129,11 @@ mod tests {
         let light = MaterialId(0);
 
         let mut scene = SceneDescription::new("emissive-triangle", camera);
-        scene.materials.push(MaterialDescription::new(
+        scene.materials.push(make_diffuse(
             light,
             "light",
-            MaterialKind::Diffuse {
-                albedo: ColorRgb::BLACK,
-                emission: ColorRgb::new(3.0, 2.0, 1.0),
-            },
+            ColorRgb::BLACK,
+            ColorRgb::new(3.0, 2.0, 1.0),
         ));
         scene.objects.push(SceneObject::new(
             "light",
@@ -866,21 +1162,17 @@ mod tests {
         let light = MaterialId(1);
 
         let mut scene = SceneDescription::new("direct-light-regression", camera);
-        scene.materials.push(MaterialDescription::new(
+        scene.materials.push(make_diffuse(
             receiver,
             "receiver",
-            MaterialKind::Diffuse {
-                albedo: ColorRgb::new(0.8, 0.8, 0.8),
-                emission: ColorRgb::BLACK,
-            },
+            ColorRgb::new(0.8, 0.8, 0.8),
+            ColorRgb::BLACK,
         ));
-        scene.materials.push(MaterialDescription::new(
+        scene.materials.push(make_diffuse(
             light,
             "light",
-            MaterialKind::Diffuse {
-                albedo: ColorRgb::BLACK,
-                emission: ColorRgb::new(4.0, 4.0, 4.0),
-            },
+            ColorRgb::BLACK,
+            ColorRgb::new(4.0, 4.0, 4.0),
         ));
 
         scene.objects.push(SceneObject::new(
@@ -930,29 +1222,23 @@ mod tests {
         let occluder = MaterialId(2);
 
         let mut scene = SceneDescription::new("simple-lighting", camera);
-        scene.materials.push(MaterialDescription::new(
+        scene.materials.push(make_diffuse(
             matte,
             "matte",
-            MaterialKind::Diffuse {
-                albedo: ColorRgb::new(0.8, 0.8, 0.8),
-                emission: ColorRgb::BLACK,
-            },
+            ColorRgb::new(0.8, 0.8, 0.8),
+            ColorRgb::BLACK,
         ));
-        scene.materials.push(MaterialDescription::new(
+        scene.materials.push(make_diffuse(
             light,
             "light",
-            MaterialKind::Diffuse {
-                albedo: ColorRgb::BLACK,
-                emission: ColorRgb::new(4.0, 4.0, 4.0),
-            },
+            ColorRgb::BLACK,
+            ColorRgb::new(4.0, 4.0, 4.0),
         ));
-        scene.materials.push(MaterialDescription::new(
+        scene.materials.push(make_diffuse(
             occluder,
             "occluder",
-            MaterialKind::Diffuse {
-                albedo: ColorRgb::new(0.2, 0.2, 0.8),
-                emission: ColorRgb::BLACK,
-            },
+            ColorRgb::new(0.2, 0.2, 0.8),
+            ColorRgb::BLACK,
         ));
 
         scene.objects.push(SceneObject::new(
@@ -1010,37 +1296,29 @@ mod tests {
         let blocker = MaterialId(3);
 
         let mut scene = SceneDescription::new("indirect-bounce", camera);
-        scene.materials.push(MaterialDescription::new(
+        scene.materials.push(make_diffuse(
             receiver,
             "receiver",
-            MaterialKind::Diffuse {
-                albedo: ColorRgb::new(0.8, 0.8, 0.8),
-                emission: ColorRgb::BLACK,
-            },
+            ColorRgb::new(0.8, 0.8, 0.8),
+            ColorRgb::BLACK,
         ));
-        scene.materials.push(MaterialDescription::new(
+        scene.materials.push(make_diffuse(
             bounce,
             "bounce",
-            MaterialKind::Diffuse {
-                albedo: ColorRgb::new(0.8, 0.2, 0.2),
-                emission: ColorRgb::BLACK,
-            },
+            ColorRgb::new(0.8, 0.2, 0.2),
+            ColorRgb::BLACK,
         ));
-        scene.materials.push(MaterialDescription::new(
+        scene.materials.push(make_diffuse(
             light,
             "light",
-            MaterialKind::Diffuse {
-                albedo: ColorRgb::BLACK,
-                emission: ColorRgb::new(5.0, 5.0, 5.0),
-            },
+            ColorRgb::BLACK,
+            ColorRgb::new(5.0, 5.0, 5.0),
         ));
-        scene.materials.push(MaterialDescription::new(
+        scene.materials.push(make_diffuse(
             blocker,
             "blocker",
-            MaterialKind::Diffuse {
-                albedo: ColorRgb::new(0.7, 0.7, 0.7),
-                emission: ColorRgb::BLACK,
-            },
+            ColorRgb::new(0.7, 0.7, 0.7),
+            ColorRgb::BLACK,
         ));
 
         scene.objects.push(SceneObject::new(
@@ -1115,6 +1393,197 @@ mod tests {
         scene
     }
 
+    fn mirror_reflection_scene() -> SceneDescription {
+        let camera = Camera::new(
+            "main",
+            Point3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            Vec3::Y,
+            45.0,
+        );
+        let mirror = MaterialId(0);
+        let light = MaterialId(1);
+
+        let mut scene = SceneDescription::new("mirror-reflection", camera);
+        scene.materials.push(MaterialDescription::new(
+            mirror,
+            "mirror",
+            MaterialKind::SpecularReflector {
+                reflectance: ColorRgb::WHITE,
+            },
+        ));
+        scene.materials.push(make_diffuse(
+            light,
+            "light",
+            ColorRgb::BLACK,
+            ColorRgb::new(3.0, 3.0, 3.0),
+        ));
+
+        scene.objects.push(SceneObject::new(
+            "mirror",
+            Geometry::TriangleMesh {
+                triangles: vec![
+                    Triangle::new(
+                        Point3::new(-1.0, -1.0, 0.0),
+                        Point3::new(1.0, -1.0, 0.0),
+                        Point3::new(1.0, 1.0, 0.0),
+                    ),
+                    Triangle::new(
+                        Point3::new(-1.0, -1.0, 0.0),
+                        Point3::new(1.0, 1.0, 0.0),
+                        Point3::new(-1.0, 1.0, 0.0),
+                    ),
+                ],
+            },
+            mirror,
+        ));
+        scene.objects.push(SceneObject::new(
+            "light",
+            Geometry::TriangleMesh {
+                triangles: vec![
+                    Triangle::new(
+                        Point3::new(-1.0, -1.0, 2.0),
+                        Point3::new(1.0, 1.0, 2.0),
+                        Point3::new(1.0, -1.0, 2.0),
+                    ),
+                    Triangle::new(
+                        Point3::new(-1.0, -1.0, 2.0),
+                        Point3::new(-1.0, 1.0, 2.0),
+                        Point3::new(1.0, 1.0, 2.0),
+                    ),
+                ],
+            },
+            light,
+        ));
+
+        scene
+    }
+
+    fn mirror_direct_light_regression_scene() -> SceneDescription {
+        let camera = Camera::new(
+            "main",
+            Point3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            Vec3::Y,
+            45.0,
+        );
+        let mirror = MaterialId(0);
+        let light = MaterialId(1);
+
+        let mut scene = SceneDescription::new("mirror-direct-light-regression", camera);
+        scene.materials.push(MaterialDescription::new(
+            mirror,
+            "mirror",
+            MaterialKind::SpecularReflector {
+                reflectance: ColorRgb::WHITE,
+            },
+        ));
+        scene.materials.push(make_diffuse(
+            light,
+            "light",
+            ColorRgb::BLACK,
+            ColorRgb::new(2.0, 2.0, 2.0),
+        ));
+
+        scene.objects.push(SceneObject::new(
+            "mirror",
+            Geometry::TriangleMesh {
+                triangles: vec![
+                    Triangle::new(
+                        Point3::new(-1.0, -1.0, 0.0),
+                        Point3::new(1.0, -1.0, 0.0),
+                        Point3::new(1.0, 1.0, 0.0),
+                    ),
+                    Triangle::new(
+                        Point3::new(-1.0, -1.0, 0.0),
+                        Point3::new(1.0, 1.0, 0.0),
+                        Point3::new(-1.0, 1.0, 0.0),
+                    ),
+                ],
+            },
+            mirror,
+        ));
+        scene.objects.push(SceneObject::new(
+            "light",
+            Geometry::TriangleMesh {
+                triangles: vec![Triangle::new(
+                    Point3::new(0.35, -0.35, 0.8),
+                    Point3::new(0.85, 0.0, 0.8),
+                    Point3::new(0.35, 0.35, 0.8),
+                )],
+            },
+            light,
+        ));
+
+        scene
+    }
+
+    fn glass_transmission_scene() -> SceneDescription {
+        let camera = Camera::new(
+            "main",
+            Point3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            Vec3::Y,
+            45.0,
+        );
+        let glass = MaterialId(0);
+        let light = MaterialId(1);
+
+        let mut scene = SceneDescription::new("glass-transmission", camera);
+        scene.materials.push(MaterialDescription::new(
+            glass,
+            "glass",
+            MaterialKind::Dielectric {
+                refractive_index: 1.5,
+            },
+        ));
+        scene.materials.push(make_diffuse(
+            light,
+            "light",
+            ColorRgb::BLACK,
+            ColorRgb::new(3.0, 2.5, 2.0),
+        ));
+
+        scene.objects.push(SceneObject::new(
+            "glass",
+            Geometry::TriangleMesh {
+                triangles: vec![
+                    Triangle::new(
+                        Point3::new(-1.0, -1.0, 0.0),
+                        Point3::new(1.0, -1.0, 0.0),
+                        Point3::new(1.0, 1.0, 0.0),
+                    ),
+                    Triangle::new(
+                        Point3::new(-1.0, -1.0, 0.0),
+                        Point3::new(1.0, 1.0, 0.0),
+                        Point3::new(-1.0, 1.0, 0.0),
+                    ),
+                ],
+            },
+            glass,
+        ));
+        scene.objects.push(SceneObject::new(
+            "light",
+            Geometry::TriangleMesh {
+                triangles: vec![
+                    Triangle::new(
+                        Point3::new(-1.0, -1.0, -2.0),
+                        Point3::new(1.0, -1.0, -2.0),
+                        Point3::new(1.0, 1.0, -2.0),
+                    ),
+                    Triangle::new(
+                        Point3::new(-1.0, -1.0, -2.0),
+                        Point3::new(1.0, 1.0, -2.0),
+                        Point3::new(-1.0, 1.0, -2.0),
+                    ),
+                ],
+            },
+            light,
+        ));
+
+        scene
+    }
+
     fn lit_room_scene() -> SceneDescription {
         let camera = Camera::new(
             "main",
@@ -1130,37 +1599,29 @@ mod tests {
         let light = MaterialId(3);
 
         let mut scene = SceneDescription::new("lit-room", camera);
-        scene.materials.push(MaterialDescription::new(
+        scene.materials.push(make_diffuse(
             red,
             "red",
-            MaterialKind::Diffuse {
-                albedo: ColorRgb::new(0.8, 0.2, 0.2),
-                emission: ColorRgb::BLACK,
-            },
+            ColorRgb::new(0.8, 0.2, 0.2),
+            ColorRgb::BLACK,
         ));
-        scene.materials.push(MaterialDescription::new(
+        scene.materials.push(make_diffuse(
             green,
             "green",
-            MaterialKind::Diffuse {
-                albedo: ColorRgb::new(0.2, 0.8, 0.2),
-                emission: ColorRgb::BLACK,
-            },
+            ColorRgb::new(0.2, 0.8, 0.2),
+            ColorRgb::BLACK,
         ));
-        scene.materials.push(MaterialDescription::new(
+        scene.materials.push(make_diffuse(
             white,
             "white",
-            MaterialKind::Diffuse {
-                albedo: ColorRgb::new(0.8, 0.8, 0.8),
-                emission: ColorRgb::BLACK,
-            },
+            ColorRgb::new(0.8, 0.8, 0.8),
+            ColorRgb::BLACK,
         ));
-        scene.materials.push(MaterialDescription::new(
+        scene.materials.push(make_diffuse(
             light,
             "light",
-            MaterialKind::Diffuse {
-                albedo: ColorRgb::BLACK,
-                emission: ColorRgb::new(5.0, 4.8, 4.4),
-            },
+            ColorRgb::BLACK,
+            ColorRgb::new(5.0, 4.8, 4.4),
         ));
 
         scene.objects.push(make_quad(
@@ -1223,6 +1684,19 @@ mod tests {
         scene
     }
 
+    fn make_diffuse(
+        material_id: MaterialId,
+        name: &str,
+        albedo: ColorRgb,
+        emission: ColorRgb,
+    ) -> MaterialDescription {
+        MaterialDescription::new(
+            material_id,
+            name,
+            MaterialKind::Diffuse { albedo, emission },
+        )
+    }
+
     fn make_quad(
         name: &str,
         material_id: MaterialId,
@@ -1244,5 +1718,11 @@ mod tests {
         assert!((actual.r - expected.r).abs() <= epsilon);
         assert!((actual.g - expected.g).abs() <= epsilon);
         assert!((actual.b - expected.b).abs() <= epsilon);
+    }
+
+    fn assert_vec3_near(actual: Vec3, expected: Vec3, epsilon: f32) {
+        assert!((actual.x - expected.x).abs() <= epsilon);
+        assert!((actual.y - expected.y).abs() <= epsilon);
+        assert!((actual.z - expected.z).abs() <= epsilon);
     }
 }
