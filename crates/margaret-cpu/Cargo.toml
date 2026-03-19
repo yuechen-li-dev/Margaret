@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 margaret-core.workspace = true
+margaret-image.workspace = true
 
 [dev-dependencies]
 margaret-testutil.workspace = true
