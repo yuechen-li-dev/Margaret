@@ -18,6 +18,7 @@ intent:
     - This is not permission to spread raw Vulkan handles across the codebase.
     - This is not permission to improvise synchronization, lifetime, or destruction policy ad hoc.
     - This is not a license to build a giant abstraction tower that hides Vulkan reality.
+    - This is not an excuse to paste tutorial code into the repository without adapting it to repository ownership and boundary rules.
 
 goal:
   headline:
@@ -30,6 +31,7 @@ goal:
     - Resource creation, upload, and destruction follow a small number of established recipes.
     - Validation remains useful because the architecture is explicit instead of magical.
     - Authors do not invent new Vulkan patterns casually.
+    - A reviewer can tell who creates, owns, transitions, submits, retires, and destroys each major resource class.
 
 core_principles:
   - Prefer the dull solution.
@@ -40,7 +42,8 @@ core_principles:
   - Prefer narrow backend boundaries over engine-wide Vulkan leakage.
   - Prefer wrappers that encode ownership and repeated policy, not wrappers that pretend Vulkan does not exist.
   - Do not use a Vulkan feature merely because it exists.
-  - Do not make the renderer more "low-level" at the cost of making it less trustworthy.
+  - Do not make the renderer more low-level at the cost of making it less trustworthy.
+  - Do not let temporary bootstrap choices fossilize into permanent backend architecture.
 
 must_do:
   - Keep Vulkan behind a narrow backend boundary.
@@ -53,6 +56,8 @@ must_do:
   - Keep validation enabled during development paths unless there is a documented reason not to.
   - Prefer obvious correctness over clever wrapper design.
   - Make it easy for a reviewer to tell who creates, owns, records, submits, transitions, and destroys each class of Vulkan object.
+  - Keep feature and extension usage centralized.
+  - Keep backend state transitions and lifetime rules understandable without chasing logic across unrelated subsystems.
 
 recommended:
   - Prefer a thin renderer or backend interface above Vulkan.
@@ -65,6 +70,8 @@ recommended:
   - Prefer simple command recording phases with obvious boundaries.
   - Prefer explicit debug naming and validation-friendly diagnostics.
   - Prefer repository-established helper layers such as allocator or loader integrations when already adopted.
+  - Prefer stable pass and transition recipes over feature-local reinvention.
+  - Prefer backend code that is slightly repetitive but easy to audit over backend code that is elegant but opaque.
 
 not_recommended:
   - Raw VkDevice, VkCommandBuffer, or other core handles flowing through unrelated high-level systems.
@@ -76,8 +83,10 @@ not_recommended:
   - Re-encoding the entire Vulkan object model in custom wrappers for prestige.
   - Per-feature mini-frameworks with their own descriptor, upload, or synchronization rules.
   - Copy-pasted tutorial code without repository-specific ownership and lifetime adaptation.
-  - "Just make it work" synchronization patches with no clear policy.
+  - Just make it work synchronization patches with no clear policy.
   - Extension and feature usage without a repository-level reason.
+  - Letting resource creation patterns drift slightly from subsystem to subsystem until no one owns the real policy.
+  - Backend helpers whose real job is unclear because they blend creation, submission, synchronization, and destruction.
 
 restricted:
   - Raw Vulkan handles outside approved backend layers are restricted.
@@ -90,6 +99,9 @@ restricted:
   - Multi-threaded command recording patterns are restricted unless the repository already standardizes them.
   - Async upload and lifetime tricks are restricted unless the architecture already provides them.
   - Unsafe interop edges and platform glue are restricted to narrow documented boundaries.
+  - Feature-local destruction rules are restricted.
+  - Hidden global backend registries are restricted.
+  - Wrappers that erase important Vulkan state or synchronization facts are restricted.
 
 default_patterns:
   backend_boundary:
@@ -100,6 +112,10 @@ default_patterns:
       - High-level rendering code should depend on renderer concepts, not raw Vulkan handles.
       - Do not let unrelated systems reach into Vulkan backend internals for convenience.
       - If a type exists only to support Vulkan, keep it in Vulkan-facing layers.
+      - Do not let future backend concerns leak upward before the backend boundary requires them.
+    guidance:
+      - A non-Vulkan system should not need to know what queue family, image layout, or descriptor set policy exists.
+      - If raw Vulkan concepts are spreading outward, the boundary is failing.
 
   ownership_and_lifetime:
     headline:
@@ -110,6 +126,10 @@ default_patterns:
       - Do not let destruction policy vary casually by subsystem.
       - Prefer backend-owned resource wrappers when they encode real lifetime rules.
       - If an object's lifetime is unclear, simplify the design before adding helpers.
+      - Use deferred destruction only where the repository already establishes a clear retirement model.
+    guidance:
+      - Vulkan punishes vague ownership.
+      - If no one can say exactly when an object dies and why it is safe to die there, the design is not ready.
 
   device_and_resource_creation:
     headline:
@@ -119,6 +139,10 @@ default_patterns:
       - Reuse standardized creation helpers for common buffers, images, samplers, and views.
       - Do not duplicate setup logic with small variations across the codebase.
       - Keep feature and extension enabling decisions centralized.
+      - Keep memory allocation and binding policy consistent with repository conventions.
+    guidance:
+      - Resource creation is not merely boilerplate.
+      - It is where capabilities, memory policy, debug labeling, and lifetime assumptions become real.
 
   frame_resources:
     headline:
@@ -128,6 +152,10 @@ default_patterns:
       - Keep fences, semaphores, transient allocators, and temporary buffers organized per established frame structure.
       - Do not mix permanent resources and frame-local scratch state carelessly.
       - Make frame ownership and reset points obvious.
+      - Keep frame-in-flight count and reuse rules centralized.
+    guidance:
+      - Frame logic is one of the fastest ways for a Vulkan backend to become haunted.
+      - A repeated predictable per-frame pattern is far better than feature-local improvisation.
 
   command_recording:
     headline:
@@ -137,6 +165,10 @@ default_patterns:
       - Keep command buffer ownership and reuse policy explicit.
       - Do not let arbitrary systems record commands whenever they feel like it.
       - Keep render pass, pipeline, descriptor, and resource binding order consistent where practical.
+      - Make pass boundaries and command ownership visible in the code structure.
+    guidance:
+      - Command recording should look boring on purpose.
+      - If every feature records commands differently, debugging and review become much harder than they need to be.
 
   synchronization:
     headline:
@@ -147,6 +179,10 @@ default_patterns:
       - Keep resource transition and visibility rules in known locations.
       - Prefer explicit documented state-transition helpers when the repository uses them.
       - If synchronization is unclear, simplify the pass or resource model before adding more barriers.
+      - Keep ownership of synchronization decisions with backend policy code, not feature-local glue.
+    guidance:
+      - Plausible-looking synchronization is not good enough.
+      - The repository should have a synchronization doctrine, not a pile of individually reasonable guesses.
 
   uploads_and_transfers:
     headline:
@@ -156,6 +192,10 @@ default_patterns:
       - Keep ownership and retirement of staging resources explicit.
       - Do not create one-off upload flows for each feature.
       - Make transfer completion and resource readiness rules obvious.
+      - Keep CPU-visible staging behavior and GPU-only final placement policy consistent.
+    guidance:
+      - Upload code often begins as a temporary utility and then metastasizes.
+      - Standardize it early so features do not each grow their own upload religion.
 
   descriptors_and_pipelines:
     headline:
@@ -165,6 +205,10 @@ default_patterns:
       - Do not invent new descriptor lifetime models casually.
       - Keep pipeline creation and caching policy centralized where practical.
       - Avoid feature-local descriptor management systems that duplicate backend infrastructure.
+      - Keep descriptor ownership and update timing understandable from local code.
+    guidance:
+      - Descriptors and pipelines are where tutorial code often turns into folklore.
+      - The backend should establish a few stable recipes and repeat them consistently.
 
   wrappers:
     headline:
@@ -174,6 +218,10 @@ default_patterns:
       - Do not wrap every Vulkan object just to avoid seeing Vulkan names.
       - Do not hide synchronization, allocation, or submission cost behind pleasant method names.
       - Prefer thin explicit wrappers over fake-engine object mythology.
+      - Keep the mapping from wrapper to underlying Vulkan facts easy to understand.
+    guidance:
+      - A good wrapper helps the reviewer reason better.
+      - A bad wrapper only makes the code feel higher-level while obscuring what still matters.
 
   validation_and_debugging:
     headline:
@@ -183,6 +231,10 @@ default_patterns:
       - Surface validation failures clearly.
       - Use debug names and labels where the repository already supports them.
       - Do not suppress warnings by making the architecture less explicit.
+      - Prefer development flows that make backend mistakes noisy.
+    guidance:
+      - Validation is not a cleanup step after the architecture is finished.
+      - It is part of how the architecture stays honest.
 
   portability_and_features:
     headline:
@@ -192,6 +244,10 @@ default_patterns:
       - Keep capability checks centralized.
       - Do not let individual subsystems negotiate backend capability independently.
       - Isolate platform-specific surface or windowing glue behind narrow boundaries.
+      - Do not let optional feature paths silently fork the backend architecture.
+    guidance:
+      - Each enabled feature or extension increases backend surface area.
+      - That cost should be paid consciously, not accidentally.
 
 author_operating_rules:
   - First inspect nearby backend code and mirror established Vulkan patterns.
@@ -206,6 +262,8 @@ author_operating_rules:
   - Do not paste tutorial architecture into the repository without adapting it to repository ownership and boundary rules.
   - Do not solve a local Vulkan problem by leaking Vulkan deeper into the engine.
   - Do not mistake validation silence for architectural quality.
+  - Do not make a new helper merely because the raw call sequence looks repetitive; make one only when the helper encodes real repeated policy.
+  - Do not let feature code quietly become backend policy code.
 
 decision_rules:
   - Prefer code that is obviously correct over code that is merely plausible-looking Vulkan.
@@ -214,6 +272,7 @@ decision_rules:
   - Prefer centralized synchronization policy over distributed barrier folklore.
   - Prefer explicit resource lifecycle rules over convenience helpers with hidden consequences.
   - Prefer wrappers that help the reviewer reason better, not wrappers that erase important facts.
+  - Prefer slightly repetitive explicit backend code over abstraction that makes validation and lifetime harder to audit.
   - If the clever solution and the boring solution are both valid, choose the boring solution.
 
 examples:
@@ -255,6 +314,9 @@ review_checklist:
     - Would a reviewer understand who records, submits, and retires the relevant commands and resources?
     - Does this make validation easier to trust or harder to trust?
     - Would the simplest valid backend version of this change look substantially different?
+    - Did this change create a new backend policy center accidentally inside feature code?
+    - Are feature, extension, and capability assumptions still centralized?
+
   reject_if:
     - The change leaks raw Vulkan concepts deeper into unrelated systems.
     - The change introduces ad hoc synchronization or layout transitions.
@@ -262,6 +324,7 @@ review_checklist:
     - The change invents unnecessary wrapper layers.
     - The change duplicates backend policy in feature-local code.
     - The change makes review, debugging, validation, or future refactoring meaningfully harder.
+    - The change quietly establishes a second recipe for the same class of backend problem.
 
 closing:
   message:
