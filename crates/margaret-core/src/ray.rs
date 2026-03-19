@@ -21,5 +21,6 @@ pub struct HitRecord {
     pub distance: f32,
     pub position: Point3,
     pub normal: Vec3,
+    pub front_face: bool,
     pub triangle_index: usize,
 }
