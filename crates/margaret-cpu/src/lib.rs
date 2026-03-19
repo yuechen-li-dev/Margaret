@@ -14,7 +14,7 @@ const MISS_COLOR: ColorRgba8 = ColorRgba8::new(18, 24, 32, 255);
 const DEPTH_MISS_COLOR: ColorRgba8 = ColorRgba8::new(0, 0, 0, 255);
 const INV_PI: f32 = 0.318_309_87;
 const LIT_SAMPLES_PER_PIXEL: u32 = 16;
-const MAX_DIFFUSE_BOUNCES: u32 = 3;
+const MAX_PATH_VERTICES: u32 = 3;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CpuRendererBackend;
@@ -227,14 +227,16 @@ fn trace_diffuse_path(
     let mut throughput = ColorRgb::WHITE;
     let mut radiance = ColorRgb::BLACK;
 
-    for _bounce_index in 0..MAX_DIFFUSE_BOUNCES {
+    for path_vertex_index in 0..MAX_PATH_VERTICES {
         let Some(hit) = closest_hit(scene, ray) else {
             break;
         };
 
         let material =
             find_material(scene, hit.material_id).expect("scene hit referenced a missing material");
-        radiance += throughput * visible_emissive_radiance(material, hit.front_face);
+        if path_vertex_index == 0 {
+            radiance += throughput * visible_emissive_radiance(material, hit.front_face);
+        }
 
         if material.is_emissive() {
             break;
@@ -245,6 +247,9 @@ fn trace_diffuse_path(
             radiance += throughput * evaluate_direct_light(scene, &hit, albedo, light);
         }
 
+        // With Lambertian BRDF f = albedo / pi and cosine-weighted hemisphere
+        // sampling pdf = cos(theta) / pi, the throughput factor f * cos / pdf
+        // reduces to multiplying by albedo.
         throughput = throughput * albedo;
         if is_black(throughput) {
             break;
@@ -487,7 +492,8 @@ mod tests {
     use super::{
         closest_hit, color_rgb_to_rgba8, find_material, intersect_triangle, miss_color,
         sample_cosine_weighted_hemisphere, trace_diffuse_path, CpuRendererBackend, PixelRng,
-        SceneHit, DEPTH_MISS_COLOR, LIT_SAMPLES_PER_PIXEL, MIN_HIT_DISTANCE, MISS_COLOR,
+        SceneHit, DEPTH_MISS_COLOR, LIT_SAMPLES_PER_PIXEL, MAX_PATH_VERTICES, MIN_HIT_DISTANCE,
+        MISS_COLOR,
     };
     use margaret_core::camera::Camera;
     use margaret_core::color::{ColorRgb, ColorRgba8};
@@ -512,6 +518,7 @@ mod tests {
         assert_eq!(metadata.object_count, 7);
         assert_eq!(metadata.light_count, 2);
         assert_eq!(metadata.sample_count, LIT_SAMPLES_PER_PIXEL);
+        assert_eq!(MAX_PATH_VERTICES, 3);
     }
 
     #[test]
@@ -666,6 +673,49 @@ mod tests {
     }
 
     #[test]
+    fn primary_camera_ray_sees_front_face_emission() {
+        let scene = emissive_triangle_scene();
+        let lights = super::collect_emissive_triangles(&scene);
+        let ray = Ray::new(Point3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 0.0, -1.0));
+        let mut rng = PixelRng::new(1, 2);
+
+        let color = trace_diffuse_path(&scene, ray, &lights, &mut rng);
+
+        assert!(color.r > 0.0);
+        assert!(color.g > 0.0);
+        assert!(color.b > 0.0);
+    }
+
+    #[test]
+    fn primary_camera_ray_rejects_back_face_emission() {
+        let scene = emissive_triangle_scene();
+        let lights = super::collect_emissive_triangles(&scene);
+        let ray = Ray::new(Point3::new(0.0, 0.0, -1.0), Vec3::new(0.0, 0.0, 1.0));
+        let mut rng = PixelRng::new(3, 4);
+
+        let color = trace_diffuse_path(&scene, ray, &lights, &mut rng);
+
+        assert_eq!(color, ColorRgb::BLACK);
+    }
+
+    #[test]
+    fn direct_light_stays_black_when_first_hit_cannot_see_emitter() {
+        let scene = indirect_bounce_scene();
+        let lights = super::collect_emissive_triangles(&scene);
+        let hit = SceneHit {
+            distance: 1.5,
+            position: Point3::new(0.0, 0.0, 0.0),
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            front_face: true,
+            material_id: MaterialId(0),
+        };
+
+        let color = super::shade_lit(&scene, &hit, &lights);
+
+        assert_eq!(color, ColorRgb::BLACK);
+    }
+
+    #[test]
     fn path_trace_adds_indirect_bounce_when_light_is_hidden_from_first_hit() {
         let scene = indirect_bounce_scene();
         let lights = super::collect_emissive_triangles(&scene);
@@ -680,6 +730,26 @@ mod tests {
         assert!(color.r > 0.0);
         assert!(color.g > 0.0);
         assert!(color.b > 0.0);
+    }
+
+    #[test]
+    fn path_trace_does_not_double_count_direct_emitter_hits_after_diffuse_bounce() {
+        let scene = direct_light_regression_scene();
+        let lights = super::collect_emissive_triangles(&scene);
+        let ray = Ray::new(Point3::new(0.0, 0.0, 2.0), Vec3::new(0.0, 0.0, -1.0));
+        let hit = SceneHit {
+            distance: 2.0,
+            position: Point3::new(0.0, 0.0, 0.0),
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            front_face: true,
+            material_id: MaterialId(0),
+        };
+        let expected_direct = super::shade_lit(&scene, &hit, &lights);
+        let mut rng = PixelRng::new(5, 6);
+
+        let color = trace_diffuse_path(&scene, ray, &lights, &mut rng);
+
+        assert_color_near(color, expected_direct, 0.0001);
     }
 
     #[test]
@@ -745,6 +815,102 @@ mod tests {
                 )],
             },
             material_id,
+        ));
+
+        scene
+    }
+
+    fn emissive_triangle_scene() -> SceneDescription {
+        let camera = Camera::new(
+            "main",
+            Point3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            Vec3::Y,
+            45.0,
+        );
+        let light = MaterialId(0);
+
+        let mut scene = SceneDescription::new("emissive-triangle", camera);
+        scene.materials.push(MaterialDescription::new(
+            light,
+            "light",
+            MaterialKind::Diffuse {
+                albedo: ColorRgb::BLACK,
+                emission: ColorRgb::new(3.0, 2.0, 1.0),
+            },
+        ));
+        scene.objects.push(SceneObject::new(
+            "light",
+            Geometry::TriangleMesh {
+                triangles: vec![Triangle::new(
+                    Point3::new(-1.0, -1.0, 0.0),
+                    Point3::new(1.0, -1.0, 0.0),
+                    Point3::new(0.0, 1.0, 0.0),
+                )],
+            },
+            light,
+        ));
+
+        scene
+    }
+
+    fn direct_light_regression_scene() -> SceneDescription {
+        let camera = Camera::new(
+            "main",
+            Point3::new(0.0, 0.0, 2.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            Vec3::Y,
+            45.0,
+        );
+        let receiver = MaterialId(0);
+        let light = MaterialId(1);
+
+        let mut scene = SceneDescription::new("direct-light-regression", camera);
+        scene.materials.push(MaterialDescription::new(
+            receiver,
+            "receiver",
+            MaterialKind::Diffuse {
+                albedo: ColorRgb::new(0.8, 0.8, 0.8),
+                emission: ColorRgb::BLACK,
+            },
+        ));
+        scene.materials.push(MaterialDescription::new(
+            light,
+            "light",
+            MaterialKind::Diffuse {
+                albedo: ColorRgb::BLACK,
+                emission: ColorRgb::new(4.0, 4.0, 4.0),
+            },
+        ));
+
+        scene.objects.push(SceneObject::new(
+            "receiver",
+            Geometry::TriangleMesh {
+                triangles: vec![Triangle::new(
+                    Point3::new(-1.0, -1.0, 0.0),
+                    Point3::new(1.0, -1.0, 0.0),
+                    Point3::new(0.0, 1.0, 0.0),
+                )],
+            },
+            receiver,
+        ));
+        scene.objects.push(SceneObject::new(
+            "light",
+            Geometry::TriangleMesh {
+                triangles: vec![
+                    Triangle::new(
+                        Point3::new(-100.0, -100.0, 1.0),
+                        Point3::new(100.0, 100.0, 1.0),
+                        Point3::new(100.0, -100.0, 1.0),
+                    ),
+                    Triangle::new(
+                        Point3::new(-100.0, -100.0, 1.0),
+                        Point3::new(-100.0, 100.0, 1.0),
+                        Point3::new(100.0, 100.0, 1.0),
+                    ),
+                ],
+            },
+            light,
         ));
 
         scene
@@ -1072,5 +1238,11 @@ mod tests {
             },
             material_id,
         )
+    }
+
+    fn assert_color_near(actual: ColorRgb, expected: ColorRgb, epsilon: f32) {
+        assert!((actual.r - expected.r).abs() <= epsilon);
+        assert!((actual.g - expected.g).abs() <= epsilon);
+        assert!((actual.b - expected.b).abs() <= epsilon);
     }
 }
