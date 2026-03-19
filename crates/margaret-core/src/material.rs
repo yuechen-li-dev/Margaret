@@ -22,12 +22,17 @@ impl MaterialDescription {
     pub fn diffuse_albedo(&self) -> ColorRgb {
         match self.kind {
             MaterialKind::Diffuse { albedo, .. } => albedo,
+            MaterialKind::SpecularReflector { reflectance } => reflectance,
+            MaterialKind::Dielectric { .. } => ColorRgb::WHITE,
         }
     }
 
     pub fn emissive_radiance(&self) -> ColorRgb {
         match self.kind {
             MaterialKind::Diffuse { emission, .. } => emission,
+            MaterialKind::SpecularReflector { .. } | MaterialKind::Dielectric { .. } => {
+                ColorRgb::BLACK
+            }
         }
     }
 
@@ -41,5 +46,11 @@ pub enum MaterialKind {
     Diffuse {
         albedo: ColorRgb,
         emission: ColorRgb,
+    },
+    SpecularReflector {
+        reflectance: ColorRgb,
+    },
+    Dielectric {
+        refractive_index: f32,
     },
 }

@@ -12,7 +12,7 @@ use margaret_core::scene::{Geometry, SceneDescription, SceneObject, Triangle};
 use margaret_cpu::CpuRendererBackend;
 
 const DEFAULT_DEPTH_MAX_DISTANCE: f32 = 6.0;
-const DEFAULT_OUTPUT_PATH: &str = "margaret-m2b-normals.ppm";
+const DEFAULT_OUTPUT_PATH: &str = "margaret-m3a-normals.ppm";
 
 pub fn run() -> std::io::Result<()> {
     run_from_args(env::args_os())
@@ -40,7 +40,7 @@ where
 
     image.write_ppm(&config.output_path)?;
 
-    println!("Margaret M2b CPU diffuse path trace");
+    println!("Margaret M3a CPU path trace");
     println!("scene: {}", metadata.scene_name);
     println!("backend: {}", metadata.backend_name);
     println!("mode: {}", config.render_settings.mode.as_str());
@@ -104,10 +104,8 @@ impl CliConfig {
                     })?;
                     config.render_settings.mode = render_mode;
                     if config.output_path == Path::new(DEFAULT_OUTPUT_PATH) {
-                        config.output_path = PathBuf::from(format!(
-                            "margaret-m2b-{}.ppm",
-                            config.render_settings.mode.as_str()
-                        ));
+                        config.output_path =
+                            PathBuf::from(format!("margaret-m3a-{}.ppm", render_mode.as_str()));
                     }
                 }
                 "--width" => {
@@ -179,7 +177,9 @@ fn parse_dimension(value: &OsString, label: &str) -> std::io::Result<u32> {
 }
 
 fn print_usage() {
-    println!("Usage: margaret-cli [--mode normals|albedo|depth|lit] [--width N] [--height N] [--output PATH]");
+    println!(
+        "Usage: margaret-cli [--mode normals|albedo|depth|lit] [--width N] [--height N] [--output PATH]"
+    );
 }
 
 fn hardcoded_scene() -> SceneDescription {
@@ -195,38 +195,46 @@ fn hardcoded_scene() -> SceneDescription {
     let green = MaterialId(1);
     let white = MaterialId(2);
     let light = MaterialId(3);
+    let mirror = MaterialId(4);
+    let glass = MaterialId(5);
 
-    let mut scene = SceneDescription::new("m2b-hardcoded-path-scene", camera);
-    scene.materials.push(MaterialDescription::new(
+    let mut scene = SceneDescription::new("m3a-hardcoded-path-scene", camera);
+    scene.materials.push(make_diffuse(
         red,
         "red",
-        MaterialKind::Diffuse {
-            albedo: ColorRgb::new(0.8, 0.2, 0.2),
-            emission: ColorRgb::BLACK,
-        },
+        ColorRgb::new(0.8, 0.2, 0.2),
+        ColorRgb::BLACK,
     ));
-    scene.materials.push(MaterialDescription::new(
+    scene.materials.push(make_diffuse(
         green,
         "green",
-        MaterialKind::Diffuse {
-            albedo: ColorRgb::new(0.2, 0.8, 0.2),
-            emission: ColorRgb::BLACK,
-        },
+        ColorRgb::new(0.2, 0.8, 0.2),
+        ColorRgb::BLACK,
     ));
-    scene.materials.push(MaterialDescription::new(
+    scene.materials.push(make_diffuse(
         white,
         "white",
-        MaterialKind::Diffuse {
-            albedo: ColorRgb::new(0.8, 0.8, 0.8),
-            emission: ColorRgb::BLACK,
+        ColorRgb::new(0.8, 0.8, 0.8),
+        ColorRgb::BLACK,
+    ));
+    scene.materials.push(make_diffuse(
+        light,
+        "ceiling-light",
+        ColorRgb::BLACK,
+        ColorRgb::new(5.0, 4.8, 4.4),
+    ));
+    scene.materials.push(MaterialDescription::new(
+        mirror,
+        "mirror",
+        MaterialKind::SpecularReflector {
+            reflectance: ColorRgb::new(0.95, 0.95, 0.95),
         },
     ));
     scene.materials.push(MaterialDescription::new(
-        light,
-        "ceiling-light",
-        MaterialKind::Diffuse {
-            albedo: ColorRgb::BLACK,
-            emission: ColorRgb::new(5.0, 4.8, 4.4),
+        glass,
+        "glass",
+        MaterialKind::Dielectric {
+            refractive_index: 1.5,
         },
     ));
 
@@ -271,12 +279,20 @@ fn hardcoded_scene() -> SceneDescription {
         Point3::new(1.2, 1.0, 1.2),
     ));
     scene.objects.push(make_quad(
-        "center-panel",
-        white,
-        Point3::new(-0.45, -1.0, -0.2),
-        Point3::new(0.45, -1.0, -0.7),
-        Point3::new(0.45, 0.2, -0.7),
-        Point3::new(-0.45, 0.2, -0.2),
+        "mirror-panel",
+        mirror,
+        Point3::new(-0.9, -1.0, -0.2),
+        Point3::new(-0.15, -1.0, -0.7),
+        Point3::new(-0.15, 0.2, -0.7),
+        Point3::new(-0.9, 0.2, -0.2),
+    ));
+    scene.objects.push(make_quad(
+        "glass-panel",
+        glass,
+        Point3::new(0.15, -1.0, -0.7),
+        Point3::new(0.9, -1.0, -0.2),
+        Point3::new(0.9, 0.35, -0.2),
+        Point3::new(0.15, 0.35, -0.7),
     ));
     scene.objects.push(make_quad(
         "light",
@@ -288,6 +304,19 @@ fn hardcoded_scene() -> SceneDescription {
     ));
 
     scene
+}
+
+fn make_diffuse(
+    material_id: MaterialId,
+    name: &str,
+    albedo: ColorRgb,
+    emission: ColorRgb,
+) -> MaterialDescription {
+    MaterialDescription::new(
+        material_id,
+        name,
+        MaterialKind::Diffuse { albedo, emission },
+    )
 }
 
 fn make_quad(
@@ -310,6 +339,7 @@ fn make_quad(
 #[cfg(test)]
 mod tests {
     use super::{hardcoded_scene, run_from_args, CliConfig, DEFAULT_DEPTH_MAX_DISTANCE};
+    use margaret_core::material::MaterialKind;
     use margaret_core::render::{RenderDebugMode, RenderMode};
     use margaret_core::scene::Geometry;
     use std::ffi::OsString;
@@ -317,12 +347,26 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn hardcoded_scene_contains_room_geometry_and_emissive_quad() {
+    fn hardcoded_scene_contains_room_geometry_light_and_delta_materials() {
         let scene = hardcoded_scene();
 
-        assert_eq!(scene.objects.len(), 7);
-        assert_eq!(scene.materials.len(), 4);
+        assert_eq!(scene.objects.len(), 8);
+        assert_eq!(scene.materials.len(), 6);
         assert_eq!(scene.lights.len(), 0);
+
+        let mut mirror_count = 0;
+        let mut dielectric_count = 0;
+
+        for material in &scene.materials {
+            match material.kind {
+                MaterialKind::Diffuse { .. } => {}
+                MaterialKind::SpecularReflector { .. } => mirror_count += 1,
+                MaterialKind::Dielectric { .. } => dielectric_count += 1,
+            }
+        }
+
+        assert_eq!(mirror_count, 1);
+        assert_eq!(dielectric_count, 1);
 
         for object in &scene.objects {
             match &object.geometry {
@@ -370,7 +414,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.render_settings.mode, RenderMode::Lit);
-        assert_eq!(config.output_path, PathBuf::from("margaret-m2b-lit.ppm"));
+        assert_eq!(config.output_path, PathBuf::from("margaret-m3a-lit.ppm"));
     }
 
     #[test]
@@ -398,7 +442,7 @@ mod tests {
             config.render_settings.mode,
             RenderMode::Debug(RenderDebugMode::Depth)
         );
-        assert_eq!(config.output_path, PathBuf::from("margaret-m2b-depth.ppm"));
+        assert_eq!(config.output_path, PathBuf::from("margaret-m3a-depth.ppm"));
     }
 
     #[test]
