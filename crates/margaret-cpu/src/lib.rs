@@ -1,15 +1,16 @@
 use margaret_core::color::{ColorRgb, ColorRgba8};
-use margaret_core::image::{ImageSize, OutputPixelFormat, RenderDebugMode, RenderMetadata};
+use margaret_core::image::{ImageSize, OutputPixelFormat, RenderMetadata};
 use margaret_core::material::{MaterialDescription, MaterialId};
 use margaret_core::math::Vec3;
 use margaret_core::ray::{HitRecord, Ray};
+use margaret_core::render::{RenderDebugMode, RenderDebugSettings};
 use margaret_core::scene::{Geometry, SceneDescription, Triangle};
 use margaret_image::OwnedImage;
 
 const DETERMINANT_EPSILON: f32 = 0.000_1;
 const MIN_HIT_DISTANCE: f32 = 0.000_1;
-const DEPTH_VISUALIZATION_MAX_DISTANCE: f32 = 6.0;
 const MISS_COLOR: ColorRgba8 = ColorRgba8::new(18, 24, 32, 255);
+const DEPTH_MISS_COLOR: ColorRgba8 = ColorRgba8::new(0, 0, 0, 255);
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CpuRendererBackend;
@@ -27,14 +28,12 @@ impl CpuRendererBackend {
         &self,
         scene: &SceneDescription,
         image_size: ImageSize,
-        debug_mode: RenderDebugMode,
     ) -> RenderMetadata {
         RenderMetadata {
             backend_name: self.backend_name().to_string(),
             scene_name: scene.name.clone(),
             image_size,
             pixel_format: OutputPixelFormat::Rgba8Unorm,
-            debug_mode,
             sample_count: 1,
             object_count: scene.objects.len(),
             light_count: scene.lights.len(),
@@ -45,22 +44,29 @@ impl CpuRendererBackend {
         &self,
         scene: &SceneDescription,
         image_size: ImageSize,
-        debug_mode: RenderDebugMode,
+        debug_settings: RenderDebugSettings,
     ) -> OwnedImage {
-        let mut image = OwnedImage::new(image_size, MISS_COLOR);
+        let mut image = OwnedImage::new(image_size, miss_color(debug_settings.mode));
 
         for pixel_y in 0..image_size.height {
             for pixel_x in 0..image_size.width {
                 let ray = scene.camera.ray_for_pixel(image_size, pixel_x, pixel_y);
                 let color = match closest_hit(scene, ray) {
-                    Some(hit) => shade_hit(scene, debug_mode, &hit),
-                    None => MISS_COLOR,
+                    Some(hit) => shade_hit(scene, debug_settings, &hit),
+                    None => miss_color(debug_settings.mode),
                 };
                 image.set_pixel(pixel_x, pixel_y, color);
             }
         }
 
         image
+    }
+}
+
+fn miss_color(debug_mode: RenderDebugMode) -> ColorRgba8 {
+    match debug_mode {
+        RenderDebugMode::Depth => DEPTH_MISS_COLOR,
+        RenderDebugMode::GeometricNormals | RenderDebugMode::FlatAlbedo => MISS_COLOR,
     }
 }
 
@@ -71,11 +77,15 @@ struct SceneHit {
     pub material_id: MaterialId,
 }
 
-fn shade_hit(scene: &SceneDescription, debug_mode: RenderDebugMode, hit: &SceneHit) -> ColorRgba8 {
-    match debug_mode {
+fn shade_hit(
+    scene: &SceneDescription,
+    debug_settings: RenderDebugSettings,
+    hit: &SceneHit,
+) -> ColorRgba8 {
+    match debug_settings.mode {
         RenderDebugMode::GeometricNormals => shade_normal(hit.normal),
         RenderDebugMode::FlatAlbedo => shade_albedo(scene, hit.material_id),
-        RenderDebugMode::Depth => shade_depth(hit.distance),
+        RenderDebugMode::Depth => shade_depth(hit.distance, debug_settings.depth_max_distance),
     }
 }
 
@@ -90,8 +100,13 @@ fn shade_albedo(scene: &SceneDescription, material_id: MaterialId) -> ColorRgba8
     color_rgb_to_rgba8(material.flat_albedo())
 }
 
-fn shade_depth(distance: f32) -> ColorRgba8 {
-    let depth = (1.0 - (distance / DEPTH_VISUALIZATION_MAX_DISTANCE)).clamp(0.0, 1.0);
+fn shade_depth(distance: f32, depth_max_distance: f32) -> ColorRgba8 {
+    assert!(
+        depth_max_distance > 0.0,
+        "depth max distance must be greater than zero"
+    );
+
+    let depth = (1.0 - (distance / depth_max_distance)).clamp(0.0, 1.0);
     let channel = to_u8(depth);
     ColorRgba8::new(channel, channel, channel, 255)
 }
@@ -184,29 +199,25 @@ fn to_u8(value: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        closest_hit, color_rgb_to_rgba8, find_material, intersect_triangle, shade_depth,
-        CpuRendererBackend, DEPTH_VISUALIZATION_MAX_DISTANCE, MIN_HIT_DISTANCE, MISS_COLOR,
+        closest_hit, color_rgb_to_rgba8, find_material, intersect_triangle, miss_color,
+        shade_depth, CpuRendererBackend, DEPTH_MISS_COLOR, MIN_HIT_DISTANCE, MISS_COLOR,
     };
     use margaret_core::camera::Camera;
     use margaret_core::color::{ColorRgb, ColorRgba8};
-    use margaret_core::image::{ImageSize, RenderDebugMode};
+    use margaret_core::image::ImageSize;
     use margaret_core::material::{MaterialDescription, MaterialId, MaterialKind};
     use margaret_core::math::{Point3, Vec3};
     use margaret_core::ray::Ray;
+    use margaret_core::render::{RenderDebugMode, RenderDebugSettings};
     use margaret_core::scene::{Geometry, SceneDescription, SceneObject, Triangle};
     use margaret_testutil::sample_image_size;
 
     #[test]
     fn describe_render_reports_basic_scene_counts() {
         let backend = CpuRendererBackend::new();
-        let metadata = backend.describe_render(
-            &debug_scene(),
-            sample_image_size(),
-            RenderDebugMode::GeometricNormals,
-        );
+        let metadata = backend.describe_render(&debug_scene(), sample_image_size());
 
         assert_eq!(metadata.backend_name, "cpu");
-        assert_eq!(metadata.debug_mode, RenderDebugMode::GeometricNormals);
         assert_eq!(metadata.object_count, 6);
         assert_eq!(metadata.light_count, 0);
     }
@@ -286,7 +297,7 @@ mod tests {
         let image = backend.render(
             &debug_scene(),
             ImageSize::new(5, 5),
-            RenderDebugMode::FlatAlbedo,
+            RenderDebugSettings::new(RenderDebugMode::FlatAlbedo, 6.0),
         );
 
         assert_eq!(image.get_pixel(2, 2), ColorRgba8::new(204, 204, 204, 255));
@@ -298,7 +309,7 @@ mod tests {
         let image = backend.render(
             &single_triangle_scene(),
             ImageSize::new(3, 3),
-            RenderDebugMode::GeometricNormals,
+            RenderDebugSettings::new(RenderDebugMode::GeometricNormals, 6.0),
         );
 
         assert_eq!(image.get_pixel(1, 1), ColorRgba8::new(128, 128, 255, 255));
@@ -310,10 +321,10 @@ mod tests {
         let image = backend.render(
             &single_triangle_scene(),
             ImageSize::new(5, 5),
-            RenderDebugMode::Depth,
+            RenderDebugSettings::new(RenderDebugMode::Depth, 6.0),
         );
 
-        assert_eq!(image.get_pixel(0, 0), MISS_COLOR);
+        assert_eq!(image.get_pixel(0, 0), DEPTH_MISS_COLOR);
 
         let center = image.get_pixel(2, 2);
         assert_eq!(center.r, center.g);
@@ -323,10 +334,13 @@ mod tests {
 
     #[test]
     fn depth_shading_clamps_far_hits_to_black() {
-        assert_eq!(
-            shade_depth(DEPTH_VISUALIZATION_MAX_DISTANCE + 10.0),
-            ColorRgba8::new(0, 0, 0, 255)
-        );
+        assert_eq!(shade_depth(16.0, 6.0), ColorRgba8::new(0, 0, 0, 255));
+    }
+
+    #[test]
+    fn miss_color_uses_depth_consistent_black_for_depth_mode() {
+        assert_eq!(miss_color(RenderDebugMode::Depth), DEPTH_MISS_COLOR);
+        assert_eq!(miss_color(RenderDebugMode::GeometricNormals), MISS_COLOR);
     }
 
     #[test]

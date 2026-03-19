@@ -4,11 +4,14 @@ use std::path::{Path, PathBuf};
 
 use margaret_core::camera::Camera;
 use margaret_core::color::ColorRgb;
-use margaret_core::image::{ImageSize, RenderDebugMode};
+use margaret_core::image::ImageSize;
 use margaret_core::material::{MaterialDescription, MaterialId, MaterialKind};
 use margaret_core::math::{Point3, Vec3};
+use margaret_core::render::{RenderDebugMode, RenderDebugSettings};
 use margaret_core::scene::{Geometry, SceneDescription, SceneObject, Triangle};
 use margaret_cpu::CpuRendererBackend;
+
+const DEFAULT_DEPTH_MAX_DISTANCE: f32 = 6.0;
 
 pub fn run() -> std::io::Result<()> {
     run_from_args(env::args_os())
@@ -25,8 +28,8 @@ where
 
     let scene = hardcoded_scene();
     let backend = CpuRendererBackend::new();
-    let metadata = backend.describe_render(&scene, config.image_size, config.debug_mode);
-    let image = backend.render(&scene, config.image_size, config.debug_mode);
+    let metadata = backend.describe_render(&scene, config.image_size);
+    let image = backend.render(&scene, config.image_size, config.debug_settings);
 
     if let Some(parent) = config.output_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -39,7 +42,7 @@ where
     println!("Margaret M1b CPU debug render");
     println!("scene: {}", metadata.scene_name);
     println!("backend: {}", metadata.backend_name);
-    println!("mode: {}", metadata.debug_mode.as_str());
+    println!("mode: {}", config.debug_settings.mode.as_str());
     println!(
         "image: {}x{} {:?}",
         metadata.image_size.width, metadata.image_size.height, metadata.pixel_format
@@ -52,10 +55,10 @@ where
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct CliConfig {
     pub image_size: ImageSize,
-    pub debug_mode: RenderDebugMode,
+    pub debug_settings: RenderDebugSettings,
     pub output_path: PathBuf,
     pub show_help: bool,
 }
@@ -64,7 +67,10 @@ impl Default for CliConfig {
     fn default() -> Self {
         Self {
             image_size: ImageSize::new(320, 240),
-            debug_mode: RenderDebugMode::GeometricNormals,
+            debug_settings: RenderDebugSettings::new(
+                RenderDebugMode::GeometricNormals,
+                DEFAULT_DEPTH_MAX_DISTANCE,
+            ),
             output_path: PathBuf::from("margaret-m1b-normals.ppm"),
             show_help: false,
         }
@@ -95,11 +101,11 @@ impl CliConfig {
                             ),
                         )
                     })?;
-                    config.debug_mode = debug_mode;
+                    config.debug_settings.mode = debug_mode;
                     if config.output_path == Path::new("margaret-m1b-normals.ppm") {
                         config.output_path = PathBuf::from(format!(
                             "margaret-m1b-{}.ppm",
-                            config.debug_mode.as_str()
+                            config.debug_settings.mode.as_str()
                         ));
                     }
                 }
@@ -282,8 +288,8 @@ fn make_quad(
 
 #[cfg(test)]
 mod tests {
-    use super::{hardcoded_scene, CliConfig};
-    use margaret_core::image::RenderDebugMode;
+    use super::{hardcoded_scene, CliConfig, DEFAULT_DEPTH_MAX_DISTANCE};
+    use margaret_core::render::RenderDebugMode;
     use margaret_core::scene::Geometry;
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -318,7 +324,11 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(config.debug_mode, RenderDebugMode::FlatAlbedo);
+        assert_eq!(config.debug_settings.mode, RenderDebugMode::FlatAlbedo);
+        assert_eq!(
+            config.debug_settings.depth_max_distance,
+            DEFAULT_DEPTH_MAX_DISTANCE
+        );
         assert_eq!(config.image_size.width, 64);
         assert_eq!(config.image_size.height, 48);
         assert_eq!(config.output_path, PathBuf::from("frame.ppm"));
@@ -335,5 +345,18 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("unsupported render mode"));
+    }
+
+    #[test]
+    fn cli_config_updates_default_output_name_when_mode_changes() {
+        let config = CliConfig::parse(vec![
+            OsString::from("margaret-cli"),
+            OsString::from("--mode"),
+            OsString::from("depth"),
+        ])
+        .unwrap();
+
+        assert_eq!(config.debug_settings.mode, RenderDebugMode::Depth);
+        assert_eq!(config.output_path, PathBuf::from("margaret-m1b-depth.ppm"));
     }
 }
