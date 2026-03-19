@@ -39,6 +39,15 @@ impl MaterialDescription {
     pub fn is_emissive(&self) -> bool {
         self.emissive_radiance() != ColorRgb::BLACK
     }
+
+    pub fn has_unsupported_m3a_diffuse_emission_mix(&self) -> bool {
+        match self.kind {
+            MaterialKind::Diffuse { albedo, emission } => {
+                albedo != ColorRgb::BLACK && emission != ColorRgb::BLACK
+            }
+            MaterialKind::SpecularReflector { .. } | MaterialKind::Dielectric { .. } => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
