@@ -18,6 +18,11 @@ impl OwnedImage {
         Self { size, pixels }
     }
 
+    pub fn get_pixel(&self, x: u32, y: u32) -> ColorRgba8 {
+        let index = (y * self.size.width + x) as usize;
+        self.pixels[index]
+    }
+
     pub fn set_pixel(&mut self, x: u32, y: u32, color: ColorRgba8) {
         let index = (y * self.size.width + x) as usize;
         self.pixels[index] = color;

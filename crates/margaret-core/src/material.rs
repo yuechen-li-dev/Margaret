@@ -18,6 +18,12 @@ impl MaterialDescription {
             kind,
         }
     }
+
+    pub fn flat_albedo(&self) -> ColorRgb {
+        match self.kind {
+            MaterialKind::Diffuse { albedo } => albedo,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
