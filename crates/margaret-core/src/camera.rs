@@ -2,6 +2,8 @@ use crate::image::ImageSize;
 use crate::math::{Point3, Vec3};
 use crate::ray::Ray;
 
+const CAMERA_EPSILON: f32 = 0.000_001;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Camera {
     pub name: String,
@@ -29,8 +31,36 @@ impl Camera {
     }
 
     pub fn ray_for_pixel(&self, image_size: ImageSize, pixel_x: u32, pixel_y: u32) -> Ray {
+        assert!(image_size.width > 0, "camera image width must be non-zero");
+        assert!(
+            image_size.height > 0,
+            "camera image height must be non-zero"
+        );
+        assert!(
+            pixel_x < image_size.width,
+            "camera pixel_x must be in bounds"
+        );
+        assert!(
+            pixel_y < image_size.height,
+            "camera pixel_y must be in bounds"
+        );
+        assert!(
+            self.forward.length_squared() > CAMERA_EPSILON,
+            "camera forward vector must be non-zero"
+        );
+        assert!(
+            self.up.length_squared() > CAMERA_EPSILON,
+            "camera up vector must be non-zero"
+        );
+
         let forward = self.forward.normalized();
-        let right = forward.cross(self.up).normalized();
+        let right_unnormalized = forward.cross(self.up);
+        assert!(
+            right_unnormalized.length_squared() > CAMERA_EPSILON,
+            "camera forward and up vectors must not be parallel"
+        );
+
+        let right = right_unnormalized.normalized();
         let camera_up = right.cross(forward).normalized();
 
         let aspect_ratio = image_size.width as f32 / image_size.height as f32;
@@ -45,5 +75,28 @@ impl Camera {
 
         let direction = (forward + right * screen_x + camera_up * screen_y).normalized();
         Ray::new(self.position, direction)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Camera;
+    use crate::image::ImageSize;
+    use crate::math::{Point3, Vec3};
+
+    #[test]
+    #[should_panic(expected = "camera image width must be non-zero")]
+    fn ray_for_pixel_rejects_zero_width() {
+        let camera = Camera::new("main", Point3::ORIGIN, -Vec3::Z, Vec3::Y, 45.0);
+
+        let _ = camera.ray_for_pixel(ImageSize::new(0, 1), 0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "camera forward and up vectors must not be parallel")]
+    fn ray_for_pixel_rejects_parallel_forward_and_up() {
+        let camera = Camera::new("main", Point3::ORIGIN, Vec3::Y, Vec3::Y, 45.0);
+
+        let _ = camera.ray_for_pixel(ImageSize::new(1, 1), 0, 0);
     }
 }

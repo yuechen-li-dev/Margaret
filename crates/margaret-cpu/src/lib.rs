@@ -4,7 +4,8 @@ use margaret_core::ray::{HitRecord, Ray};
 use margaret_core::scene::{Geometry, SceneDescription, Triangle};
 use margaret_image::OwnedImage;
 
-const EPSILON: f32 = 0.000_1;
+const DETERMINANT_EPSILON: f32 = 0.000_1;
+const MIN_HIT_DISTANCE: f32 = 0.000_1;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CpuRendererBackend;
@@ -60,7 +61,7 @@ fn closest_hit(scene: &SceneDescription, ray: Ray) -> Option<HitRecord> {
         match &object.geometry {
             Geometry::TriangleMesh { triangles } => {
                 for (triangle_index, triangle) in triangles.iter().enumerate() {
-                    let hit = intersect_triangle(ray, triangle, EPSILON, closest_distance);
+                    let hit = intersect_triangle(ray, triangle, MIN_HIT_DISTANCE, closest_distance);
                     if let Some(hit) = hit {
                         closest_distance = hit.distance;
                         closest_hit = Some(HitRecord {
@@ -86,7 +87,7 @@ fn intersect_triangle(ray: Ray, triangle: &Triangle, t_min: f32, t_max: f32) -> 
     let pvec = ray.direction.cross(edge2);
     let determinant = edge1.dot(pvec);
 
-    if determinant.abs() < EPSILON {
+    if determinant.abs() < DETERMINANT_EPSILON {
         return None;
     }
 
@@ -108,10 +109,7 @@ fn intersect_triangle(ray: Ray, triangle: &Triangle, t_min: f32, t_max: f32) -> 
         return None;
     }
 
-    let mut normal = edge1.cross(edge2).normalized();
-    if normal.dot(ray.direction) > 0.0 {
-        normal = -normal;
-    }
+    let normal = triangle.geometric_normal();
 
     Some(HitRecord {
         distance,
@@ -138,7 +136,7 @@ fn to_u8(value: f32) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{closest_hit, intersect_triangle, CpuRendererBackend};
+    use super::{closest_hit, intersect_triangle, CpuRendererBackend, MIN_HIT_DISTANCE};
     use margaret_core::math::{Point3, Vec3};
     use margaret_core::ray::Ray;
     use margaret_core::scene::{Geometry, Triangle};
@@ -182,6 +180,20 @@ mod tests {
         let hit = intersect_triangle(ray, &triangle, 0.001, f32::INFINITY);
 
         assert!(hit.is_none());
+    }
+
+    #[test]
+    fn ray_triangle_intersection_keeps_geometric_normal_for_backface_hits() {
+        let ray = Ray::new(Point3::new(0.0, 0.0, -1.0), Vec3::new(0.0, 0.0, 1.0));
+        let triangle = Triangle::new(
+            Point3::new(-1.0, -1.0, 0.0),
+            Point3::new(1.0, -1.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+        );
+
+        let hit = intersect_triangle(ray, &triangle, MIN_HIT_DISTANCE, f32::INFINITY).unwrap();
+
+        assert_eq!(hit.normal, Vec3::new(0.0, 0.0, 1.0));
     }
 
     #[test]
