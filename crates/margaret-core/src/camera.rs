@@ -31,6 +31,17 @@ impl Camera {
     }
 
     pub fn ray_for_pixel(&self, image_size: ImageSize, pixel_x: u32, pixel_y: u32) -> Ray {
+        self.ray_for_subpixel(image_size, pixel_x, pixel_y, 0.5, 0.5)
+    }
+
+    pub fn ray_for_subpixel(
+        &self,
+        image_size: ImageSize,
+        pixel_x: u32,
+        pixel_y: u32,
+        subpixel_x: f32,
+        subpixel_y: f32,
+    ) -> Ray {
         assert!(image_size.width > 0, "camera image width must be non-zero");
         assert!(
             image_size.height > 0,
@@ -67,8 +78,17 @@ impl Camera {
         let half_height = (self.vertical_fov_degrees.to_radians() * 0.5).tan();
         let half_width = half_height * aspect_ratio;
 
-        let pixel_center_x = (pixel_x as f32 + 0.5) / image_size.width as f32;
-        let pixel_center_y = (pixel_y as f32 + 0.5) / image_size.height as f32;
+        assert!(
+            (0.0..=1.0).contains(&subpixel_x),
+            "camera subpixel_x must be in [0, 1]"
+        );
+        assert!(
+            (0.0..=1.0).contains(&subpixel_y),
+            "camera subpixel_y must be in [0, 1]"
+        );
+
+        let pixel_center_x = (pixel_x as f32 + subpixel_x) / image_size.width as f32;
+        let pixel_center_y = (pixel_y as f32 + subpixel_y) / image_size.height as f32;
 
         let screen_x = (2.0 * pixel_center_x - 1.0) * half_width;
         let screen_y = (1.0 - 2.0 * pixel_center_y) * half_height;

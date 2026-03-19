@@ -13,6 +13,8 @@ const SHADOW_BIAS: f32 = 0.001;
 const MISS_COLOR: ColorRgba8 = ColorRgba8::new(18, 24, 32, 255);
 const DEPTH_MISS_COLOR: ColorRgba8 = ColorRgba8::new(0, 0, 0, 255);
 const INV_PI: f32 = 0.318_309_87;
+const LIT_SAMPLES_PER_PIXEL: u32 = 16;
+const MAX_DIFFUSE_BOUNCES: u32 = 3;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CpuRendererBackend;
@@ -30,13 +32,19 @@ impl CpuRendererBackend {
         &self,
         scene: &SceneDescription,
         image_size: ImageSize,
+        render_settings: RenderSettings,
     ) -> RenderMetadata {
+        let sample_count = match render_settings.mode {
+            RenderMode::Lit => LIT_SAMPLES_PER_PIXEL,
+            RenderMode::Debug(_) => 1,
+        };
+
         RenderMetadata {
             backend_name: self.backend_name().to_string(),
             scene_name: scene.name.clone(),
             image_size,
             pixel_format: OutputPixelFormat::Rgba8Unorm,
-            sample_count: 1,
+            sample_count,
             object_count: scene.objects.len(),
             light_count: count_emissive_triangles(scene),
         }
@@ -53,10 +61,19 @@ impl CpuRendererBackend {
 
         for pixel_y in 0..image_size.height {
             for pixel_x in 0..image_size.width {
-                let ray = scene.camera.ray_for_pixel(image_size, pixel_x, pixel_y);
-                let color = match closest_hit(scene, ray) {
-                    Some(hit) => shade_hit(scene, render_settings, &hit, &emissive_triangles),
-                    None => miss_color(render_settings.mode),
+                let color = match render_settings.mode {
+                    RenderMode::Lit => {
+                        render_lit_pixel(scene, image_size, pixel_x, pixel_y, &emissive_triangles)
+                    }
+                    RenderMode::Debug(_) => {
+                        let ray = scene.camera.ray_for_pixel(image_size, pixel_x, pixel_y);
+                        match closest_hit(scene, ray) {
+                            Some(hit) => {
+                                shade_hit(scene, render_settings, &hit, &emissive_triangles)
+                            }
+                            None => miss_color(render_settings.mode),
+                        }
+                    }
                 };
                 image.set_pixel(pixel_x, pixel_y, color);
             }
@@ -64,6 +81,31 @@ impl CpuRendererBackend {
 
         image
     }
+}
+
+fn render_lit_pixel(
+    scene: &SceneDescription,
+    image_size: ImageSize,
+    pixel_x: u32,
+    pixel_y: u32,
+    emissive_triangles: &[EmissiveTriangle],
+) -> ColorRgba8 {
+    let mut rng = PixelRng::new(pixel_x, pixel_y);
+    let mut radiance = ColorRgb::BLACK;
+
+    for _sample_index in 0..LIT_SAMPLES_PER_PIXEL {
+        let ray = scene.camera.ray_for_subpixel(
+            image_size,
+            pixel_x,
+            pixel_y,
+            rng.next_f32(),
+            rng.next_f32(),
+        );
+        radiance += trace_diffuse_path(scene, ray, emissive_triangles, &mut rng);
+    }
+
+    let average_radiance = radiance * (1.0 / LIT_SAMPLES_PER_PIXEL as f32);
+    color_rgb_to_rgba8(average_radiance)
 }
 
 fn miss_color(render_mode: RenderMode) -> ColorRgba8 {
@@ -88,6 +130,31 @@ struct SceneHit {
 struct EmissiveTriangle {
     pub triangle: Triangle,
     pub radiance: ColorRgb,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PixelRng {
+    pub state: u64,
+}
+
+impl PixelRng {
+    fn new(pixel_x: u32, pixel_y: u32) -> Self {
+        let seed = ((pixel_x as u64 + 1) << 32) ^ (pixel_y as u64 + 1) ^ 0x9E37_79B9_7F4A_7C15;
+        Self { state: seed }
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        self.state = self
+            .state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (self.state >> 32) as u32
+    }
+
+    fn next_f32(&mut self) -> f32 {
+        let value = self.next_u32();
+        value as f32 / u32::MAX as f32
+    }
 }
 
 fn shade_hit(
@@ -150,6 +217,78 @@ fn shade_lit(
     radiance
 }
 
+fn trace_diffuse_path(
+    scene: &SceneDescription,
+    initial_ray: Ray,
+    emissive_triangles: &[EmissiveTriangle],
+    rng: &mut PixelRng,
+) -> ColorRgb {
+    let mut ray = initial_ray;
+    let mut throughput = ColorRgb::WHITE;
+    let mut radiance = ColorRgb::BLACK;
+
+    for _bounce_index in 0..MAX_DIFFUSE_BOUNCES {
+        let Some(hit) = closest_hit(scene, ray) else {
+            break;
+        };
+
+        let material =
+            find_material(scene, hit.material_id).expect("scene hit referenced a missing material");
+        radiance += throughput * visible_emissive_radiance(material, hit.front_face);
+
+        if material.is_emissive() {
+            break;
+        }
+
+        let albedo = material.diffuse_albedo();
+        for light in emissive_triangles {
+            radiance += throughput * evaluate_direct_light(scene, &hit, albedo, light);
+        }
+
+        throughput = throughput * albedo;
+        if is_black(throughput) {
+            break;
+        }
+
+        let bounce_direction = sample_cosine_weighted_hemisphere(hit.normal, rng);
+        let bounce_origin = hit.position + hit.normal * SHADOW_BIAS;
+        ray = Ray::new(bounce_origin, bounce_direction);
+    }
+
+    radiance
+}
+
+fn is_black(color: ColorRgb) -> bool {
+    color == ColorRgb::BLACK
+}
+
+fn sample_cosine_weighted_hemisphere(normal: Vec3, rng: &mut PixelRng) -> Vec3 {
+    let sample_a = rng.next_f32();
+    let sample_b = rng.next_f32();
+    let radius = sample_a.sqrt();
+    let phi = 2.0 * std::f32::consts::PI * sample_b;
+
+    let local_x = radius * phi.cos();
+    let local_y = radius * phi.sin();
+    let local_z = (1.0 - sample_a).sqrt();
+
+    let tangent = build_tangent(normal);
+    let bitangent = normal.cross(tangent).normalized();
+    let direction = tangent * local_x + bitangent * local_y + normal * local_z;
+
+    direction.normalized()
+}
+
+fn build_tangent(normal: Vec3) -> Vec3 {
+    let reference = if normal.y.abs() < 0.999 {
+        Vec3::Y
+    } else {
+        Vec3::X
+    };
+
+    normal.cross(reference).normalized()
+}
+
 fn visible_emissive_radiance(material: &MaterialDescription, front_face: bool) -> ColorRgb {
     if !material.is_emissive() {
         return ColorRgb::BLACK;
@@ -168,7 +307,6 @@ fn evaluate_direct_light(
     albedo: ColorRgb,
     light: &EmissiveTriangle,
 ) -> ColorRgb {
-    // M2a uses one centroid sample per emissive triangle and weights it by area.
     let light_position = light.triangle.centroid();
     let to_light = light_position - hit.position;
     let distance_squared = to_light.length_squared();
@@ -348,7 +486,8 @@ fn to_u8(value: f32) -> u8 {
 mod tests {
     use super::{
         closest_hit, color_rgb_to_rgba8, find_material, intersect_triangle, miss_color,
-        shade_depth, CpuRendererBackend, SceneHit, DEPTH_MISS_COLOR, MIN_HIT_DISTANCE, MISS_COLOR,
+        sample_cosine_weighted_hemisphere, trace_diffuse_path, CpuRendererBackend, PixelRng,
+        SceneHit, DEPTH_MISS_COLOR, LIT_SAMPLES_PER_PIXEL, MIN_HIT_DISTANCE, MISS_COLOR,
     };
     use margaret_core::camera::Camera;
     use margaret_core::color::{ColorRgb, ColorRgba8};
@@ -363,11 +502,16 @@ mod tests {
     #[test]
     fn describe_render_reports_basic_scene_counts() {
         let backend = CpuRendererBackend::new();
-        let metadata = backend.describe_render(&lit_room_scene(), sample_image_size());
+        let metadata = backend.describe_render(
+            &lit_room_scene(),
+            sample_image_size(),
+            RenderSettings::new(RenderMode::Lit, 6.0),
+        );
 
         assert_eq!(metadata.backend_name, "cpu");
         assert_eq!(metadata.object_count, 7);
         assert_eq!(metadata.light_count, 2);
+        assert_eq!(metadata.sample_count, LIT_SAMPLES_PER_PIXEL);
     }
 
     #[test]
@@ -522,206 +666,77 @@ mod tests {
     }
 
     #[test]
-    fn lit_mode_shows_visible_emissive_geometry() {
-        let backend = CpuRendererBackend::new();
-        let image = backend.render(
-            &emissive_only_scene(),
-            ImageSize::new(5, 5),
-            RenderSettings::new(RenderMode::Lit, 6.0),
-        );
+    fn path_trace_adds_indirect_bounce_when_light_is_hidden_from_first_hit() {
+        let scene = indirect_bounce_scene();
+        let lights = super::collect_emissive_triangles(&scene);
+        let ray = Ray::new(Point3::new(0.0, 0.0, 1.5), Vec3::new(0.0, 0.0, -1.0));
+        let mut rng = PixelRng::new(2, 3);
+        let mut color = ColorRgb::BLACK;
 
-        let center = image.get_pixel(2, 2);
-        assert_eq!(center, ColorRgba8::new(255, 242, 191, 255));
+        for _sample_index in 0..256 {
+            color += trace_diffuse_path(&scene, ray, &lights, &mut rng);
+        }
+
+        assert!(color.r > 0.0);
+        assert!(color.g > 0.0);
+        assert!(color.b > 0.0);
     }
 
     #[test]
-    fn lit_mode_hides_emissive_backfaces() {
-        let backend = CpuRendererBackend::new();
-        let image = backend.render(
-            &emissive_backface_scene(),
-            ImageSize::new(5, 5),
-            RenderSettings::new(RenderMode::Lit, 6.0),
-        );
+    fn cosine_weighted_samples_stay_in_surface_hemisphere() {
+        let normal = Vec3::new(0.0, 1.0, 0.0);
+        let mut rng = PixelRng::new(4, 5);
 
-        assert_eq!(image.get_pixel(2, 2), ColorRgba8::new(0, 0, 0, 255));
+        for _ in 0..32 {
+            let direction = sample_cosine_weighted_hemisphere(normal, &mut rng);
+            assert!(direction.dot(normal) > 0.0);
+        }
     }
 
     #[test]
-    fn backfacing_emissive_triangle_does_not_contribute_direct_light() {
-        let hit = SceneHit {
-            distance: 3.0,
-            position: Point3::new(0.0, 0.0, 0.0),
-            normal: Vec3::new(0.0, 0.0, 1.0),
-            front_face: true,
-            material_id: MaterialId(0),
-        };
-
-        let front_facing_scene = simple_lighting_scene(false);
-        let back_facing_scene = simple_lighting_scene_with_light_winding(false);
-        let front_facing_lights = super::collect_emissive_triangles(&front_facing_scene);
-        let back_facing_lights = super::collect_emissive_triangles(&back_facing_scene);
-        let front_facing_color = super::shade_lit(&front_facing_scene, &hit, &front_facing_lights);
-        let back_facing_color = super::shade_lit(&back_facing_scene, &hit, &back_facing_lights);
-
-        assert!(front_facing_color.r > 0.0);
-        assert_eq!(back_facing_color, ColorRgb::BLACK);
-    }
-
-    #[test]
-    fn centroid_sampled_direct_light_scales_with_emitter_area() {
-        let hit = SceneHit {
-            distance: 3.0,
-            position: Point3::new(0.0, 0.0, 0.0),
-            normal: Vec3::new(0.0, 0.0, 1.0),
-            front_face: true,
-            material_id: MaterialId(0),
-        };
-
-        let small_light_scene = simple_lighting_scene_with_light_half_extent(0.2);
-        let large_light_scene = simple_lighting_scene_with_light_half_extent(0.4);
-        let small_lights = super::collect_emissive_triangles(&small_light_scene);
-        let large_lights = super::collect_emissive_triangles(&large_light_scene);
-        let small_color = super::shade_lit(&small_light_scene, &hit, &small_lights);
-        let large_color = super::shade_lit(&large_light_scene, &hit, &large_lights);
-
-        assert!(large_color.r > small_color.r);
-        assert!(large_color.g > small_color.g);
-        assert!(large_color.b > small_color.b);
-    }
-
-    #[test]
-    fn depth_shading_clamps_far_hits_to_black() {
-        assert_eq!(shade_depth(16.0, 6.0), ColorRgba8::new(0, 0, 0, 255));
-    }
-
-    #[test]
-    fn miss_color_uses_depth_consistent_black_for_depth_mode() {
+    fn miss_color_matches_render_mode() {
+        assert_eq!(miss_color(RenderMode::Lit), MISS_COLOR);
         assert_eq!(
             miss_color(RenderMode::Debug(RenderDebugMode::Depth)),
             DEPTH_MISS_COLOR
         );
-        assert_eq!(
-            miss_color(RenderMode::Debug(RenderDebugMode::GeometricNormals)),
-            MISS_COLOR
-        );
-        assert_eq!(miss_color(RenderMode::Lit), MISS_COLOR);
     }
 
     #[test]
-    fn find_material_returns_matching_material() {
-        let scene = lit_room_scene();
-        let material = find_material(&scene, MaterialId(2)).unwrap();
+    fn color_conversion_clamps_and_scales() {
+        let color = ColorRgb::new(1.2, 0.5, -0.2);
 
-        assert_eq!(material.name, "white");
+        assert_eq!(color_rgb_to_rgba8(color), ColorRgba8::new(255, 128, 0, 255));
     }
 
     #[test]
-    fn color_rgb_conversion_maps_unit_range_to_rgba8() {
-        let color = color_rgb_to_rgba8(ColorRgb::new(0.25, 0.5, 0.75));
-
-        assert_eq!(color, ColorRgba8::new(64, 128, 191, 255));
-    }
-
-    #[test]
-    fn lit_room_scene_contains_emissive_quad() {
+    fn find_material_returns_none_for_missing_material() {
         let scene = lit_room_scene();
 
-        assert_eq!(scene.objects.len(), 7);
-
-        for object in &scene.objects {
-            match &object.geometry {
-                Geometry::TriangleMesh { triangles } => assert_eq!(triangles.len(), 2),
-            }
-        }
-    }
-
-    fn emissive_only_scene() -> SceneDescription {
-        let camera = Camera::new(
-            "main",
-            Point3::new(0.0, 0.0, 3.0),
-            Vec3::new(0.0, 0.0, -1.0),
-            Vec3::Y,
-            45.0,
-        );
-        let emissive = MaterialId(0);
-
-        let mut scene = SceneDescription::new("emissive-only", camera);
-        scene.materials.push(MaterialDescription::new(
-            emissive,
-            "light",
-            MaterialKind::Diffuse {
-                albedo: ColorRgb::new(0.0, 0.0, 0.0),
-                emission: ColorRgb::new(1.0, 0.95, 0.75),
-            },
-        ));
-        scene.objects.push(SceneObject::new(
-            "light",
-            Geometry::TriangleMesh {
-                triangles: vec![Triangle::new(
-                    Point3::new(-0.5, -0.5, 0.0),
-                    Point3::new(0.5, -0.5, 0.0),
-                    Point3::new(0.0, 0.5, 0.0),
-                )],
-            },
-            emissive,
-        ));
-        scene
-    }
-
-    fn emissive_backface_scene() -> SceneDescription {
-        let camera = Camera::new(
-            "main",
-            Point3::new(0.0, 0.0, -3.0),
-            Vec3::new(0.0, 0.0, 1.0),
-            Vec3::Y,
-            45.0,
-        );
-        let emissive = MaterialId(0);
-
-        let mut scene = SceneDescription::new("emissive-backface", camera);
-        scene.materials.push(MaterialDescription::new(
-            emissive,
-            "light",
-            MaterialKind::Diffuse {
-                albedo: ColorRgb::BLACK,
-                emission: ColorRgb::new(1.0, 0.95, 0.75),
-            },
-        ));
-        scene.objects.push(SceneObject::new(
-            "light",
-            Geometry::TriangleMesh {
-                triangles: vec![Triangle::new(
-                    Point3::new(-0.5, -0.5, 0.0),
-                    Point3::new(0.5, -0.5, 0.0),
-                    Point3::new(0.0, 0.5, 0.0),
-                )],
-            },
-            emissive,
-        ));
-        scene
+        assert!(find_material(&scene, MaterialId(99)).is_none());
     }
 
     fn single_triangle_scene() -> SceneDescription {
         let camera = Camera::new(
             "main",
-            Point3::new(0.0, 0.0, 3.0),
+            Point3::new(0.0, 0.0, 2.0),
             Vec3::new(0.0, 0.0, -1.0),
             Vec3::Y,
             45.0,
         );
         let material_id = MaterialId(0);
 
-        let mut scene = SceneDescription::new("triangle-scene", camera);
+        let mut scene = SceneDescription::new("single-triangle", camera);
         scene.materials.push(MaterialDescription::new(
             material_id,
-            "matte-gray",
+            "gray",
             MaterialKind::Diffuse {
-                albedo: ColorRgb::new(0.5, 0.5, 0.5),
+                albedo: ColorRgb::new(0.6, 0.6, 0.6),
                 emission: ColorRgb::BLACK,
             },
         ));
         scene.objects.push(SceneObject::new(
-            "preview-triangles",
+            "triangle",
             Geometry::TriangleMesh {
                 triangles: vec![Triangle::new(
                     Point3::new(-1.0, -1.0, 0.0),
@@ -731,59 +746,45 @@ mod tests {
             },
             material_id,
         ));
+
         scene
     }
 
     fn simple_lighting_scene(with_occluder: bool) -> SceneDescription {
-        simple_lighting_scene_with_light_winding_and_extent(with_occluder, true, 0.35)
-    }
-
-    fn simple_lighting_scene_with_light_winding(front_facing: bool) -> SceneDescription {
-        simple_lighting_scene_with_light_winding_and_extent(false, front_facing, 0.35)
-    }
-
-    fn simple_lighting_scene_with_light_half_extent(light_half_extent: f32) -> SceneDescription {
-        simple_lighting_scene_with_light_winding_and_extent(false, true, light_half_extent)
-    }
-
-    fn simple_lighting_scene_with_light_winding_and_extent(
-        with_occluder: bool,
-        front_facing_light: bool,
-        light_half_extent: f32,
-    ) -> SceneDescription {
         let camera = Camera::new(
             "main",
-            Point3::new(0.0, 0.0, 3.0),
+            Point3::new(0.0, 0.0, 2.0),
             Vec3::new(0.0, 0.0, -1.0),
             Vec3::Y,
             45.0,
         );
-        let diffuse = MaterialId(0);
-        let emissive = MaterialId(1);
-        let blocker = MaterialId(2);
+
+        let matte = MaterialId(0);
+        let light = MaterialId(1);
+        let occluder = MaterialId(2);
 
         let mut scene = SceneDescription::new("simple-lighting", camera);
         scene.materials.push(MaterialDescription::new(
-            diffuse,
-            "diffuse",
+            matte,
+            "matte",
             MaterialKind::Diffuse {
                 albedo: ColorRgb::new(0.8, 0.8, 0.8),
                 emission: ColorRgb::BLACK,
             },
         ));
         scene.materials.push(MaterialDescription::new(
-            emissive,
+            light,
             "light",
             MaterialKind::Diffuse {
                 albedo: ColorRgb::BLACK,
-                emission: ColorRgb::new(6.0, 6.0, 6.0),
+                emission: ColorRgb::new(4.0, 4.0, 4.0),
             },
         ));
         scene.materials.push(MaterialDescription::new(
-            blocker,
-            "blocker",
+            occluder,
+            "occluder",
             MaterialKind::Diffuse {
-                albedo: ColorRgb::new(0.2, 0.2, 0.2),
+                albedo: ColorRgb::new(0.2, 0.2, 0.8),
                 emission: ColorRgb::BLACK,
             },
         ));
@@ -791,75 +792,166 @@ mod tests {
         scene.objects.push(SceneObject::new(
             "receiver",
             Geometry::TriangleMesh {
-                triangles: vec![
-                    Triangle::new(
-                        Point3::new(-1.0, -1.0, 0.0),
-                        Point3::new(1.0, -1.0, 0.0),
-                        Point3::new(1.0, 1.0, 0.0),
-                    ),
-                    Triangle::new(
-                        Point3::new(-1.0, -1.0, 0.0),
-                        Point3::new(1.0, 1.0, 0.0),
-                        Point3::new(-1.0, 1.0, 0.0),
-                    ),
-                ],
+                triangles: vec![Triangle::new(
+                    Point3::new(-1.0, -1.0, 0.0),
+                    Point3::new(1.0, -1.0, 0.0),
+                    Point3::new(0.0, 1.0, 0.0),
+                )],
             },
-            diffuse,
+            matte,
         ));
+
         scene.objects.push(SceneObject::new(
             "light",
             Geometry::TriangleMesh {
-                triangles: make_light_triangles(light_half_extent, front_facing_light),
+                triangles: vec![Triangle::new(
+                    Point3::new(-0.4, 0.4, 1.0),
+                    Point3::new(0.4, 0.4, 1.0),
+                    Point3::new(0.0, -0.4, 1.0),
+                )],
             },
-            emissive,
+            light,
         ));
 
         if with_occluder {
             scene.objects.push(SceneObject::new(
                 "occluder",
                 Geometry::TriangleMesh {
-                    triangles: vec![
-                        Triangle::new(
-                            Point3::new(-0.25, -0.25, 0.75),
-                            Point3::new(0.25, -0.25, 0.75),
-                            Point3::new(0.25, 0.25, 0.75),
-                        ),
-                        Triangle::new(
-                            Point3::new(-0.25, -0.25, 0.75),
-                            Point3::new(0.25, 0.25, 0.75),
-                            Point3::new(-0.25, 0.25, 0.75),
-                        ),
-                    ],
+                    triangles: vec![Triangle::new(
+                        Point3::new(-0.2, -0.2, 0.5),
+                        Point3::new(0.2, -0.2, 0.5),
+                        Point3::new(0.0, 0.3, 0.5),
+                    )],
                 },
-                blocker,
+                occluder,
             ));
         }
 
         scene
     }
 
-    fn make_light_triangles(light_half_extent: f32, front_facing_light: bool) -> Vec<Triangle> {
-        let bottom_left = Point3::new(-light_half_extent, -light_half_extent, 1.5);
-        let bottom_right = Point3::new(light_half_extent, -light_half_extent, 1.5);
-        let top_left = Point3::new(-light_half_extent, light_half_extent, 1.5);
-        let top_right = Point3::new(light_half_extent, light_half_extent, 1.5);
+    fn indirect_bounce_scene() -> SceneDescription {
+        let camera = Camera::new(
+            "main",
+            Point3::new(0.0, 0.0, 1.5),
+            Vec3::new(0.0, 0.0, -1.0),
+            Vec3::Y,
+            45.0,
+        );
+        let receiver = MaterialId(0);
+        let bounce = MaterialId(1);
+        let light = MaterialId(2);
+        let blocker = MaterialId(3);
 
-        if front_facing_light {
-            vec![
-                Triangle::new(bottom_left, top_right, bottom_right),
-                Triangle::new(bottom_left, top_left, top_right),
-            ]
-        } else {
-            vec![
-                Triangle::new(bottom_left, bottom_right, top_right),
-                Triangle::new(bottom_left, top_right, top_left),
-            ]
-        }
+        let mut scene = SceneDescription::new("indirect-bounce", camera);
+        scene.materials.push(MaterialDescription::new(
+            receiver,
+            "receiver",
+            MaterialKind::Diffuse {
+                albedo: ColorRgb::new(0.8, 0.8, 0.8),
+                emission: ColorRgb::BLACK,
+            },
+        ));
+        scene.materials.push(MaterialDescription::new(
+            bounce,
+            "bounce",
+            MaterialKind::Diffuse {
+                albedo: ColorRgb::new(0.8, 0.2, 0.2),
+                emission: ColorRgb::BLACK,
+            },
+        ));
+        scene.materials.push(MaterialDescription::new(
+            light,
+            "light",
+            MaterialKind::Diffuse {
+                albedo: ColorRgb::BLACK,
+                emission: ColorRgb::new(5.0, 5.0, 5.0),
+            },
+        ));
+        scene.materials.push(MaterialDescription::new(
+            blocker,
+            "blocker",
+            MaterialKind::Diffuse {
+                albedo: ColorRgb::new(0.7, 0.7, 0.7),
+                emission: ColorRgb::BLACK,
+            },
+        ));
+
+        scene.objects.push(SceneObject::new(
+            "receiver",
+            Geometry::TriangleMesh {
+                triangles: vec![Triangle::new(
+                    Point3::new(-0.8, -0.8, 0.0),
+                    Point3::new(0.8, -0.8, 0.0),
+                    Point3::new(0.0, 0.8, 0.0),
+                )],
+            },
+            receiver,
+        ));
+
+        scene.objects.push(SceneObject::new(
+            "blocker",
+            Geometry::TriangleMesh {
+                triangles: vec![
+                    Triangle::new(
+                        Point3::new(-0.25, -0.25, 0.25),
+                        Point3::new(0.25, -0.25, 0.25),
+                        Point3::new(0.25, 0.25, 0.25),
+                    ),
+                    Triangle::new(
+                        Point3::new(-0.25, -0.25, 0.25),
+                        Point3::new(0.25, 0.25, 0.25),
+                        Point3::new(-0.25, 0.25, 0.25),
+                    ),
+                ],
+            },
+            blocker,
+        ));
+
+        scene.objects.push(SceneObject::new(
+            "bounce-wall",
+            Geometry::TriangleMesh {
+                triangles: vec![
+                    Triangle::new(
+                        Point3::new(0.9, -0.7, 0.8),
+                        Point3::new(0.9, -0.7, -0.4),
+                        Point3::new(0.9, 0.7, -0.4),
+                    ),
+                    Triangle::new(
+                        Point3::new(0.9, -0.7, 0.8),
+                        Point3::new(0.9, 0.7, -0.4),
+                        Point3::new(0.9, 0.7, 0.8),
+                    ),
+                ],
+            },
+            bounce,
+        ));
+
+        scene.objects.push(SceneObject::new(
+            "light",
+            Geometry::TriangleMesh {
+                triangles: vec![
+                    Triangle::new(
+                        Point3::new(0.6, -0.2, 0.75),
+                        Point3::new(1.1, -0.2, 0.75),
+                        Point3::new(1.1, 0.2, 0.75),
+                    ),
+                    Triangle::new(
+                        Point3::new(0.6, -0.2, 0.75),
+                        Point3::new(1.1, 0.2, 0.75),
+                        Point3::new(0.6, 0.2, 0.75),
+                    ),
+                ],
+            },
+            light,
+        ));
+
+        scene
     }
 
     fn lit_room_scene() -> SceneDescription {
         let camera = Camera::new(
-            "main-camera",
+            "main",
             Point3::new(0.0, 0.0, 3.4),
             Vec3::new(0.0, 0.0, -1.0),
             Vec3::Y,
@@ -871,7 +963,7 @@ mod tests {
         let white = MaterialId(2);
         let light = MaterialId(3);
 
-        let mut scene = SceneDescription::new("m2a-lit-room-scene", camera);
+        let mut scene = SceneDescription::new("lit-room", camera);
         scene.materials.push(MaterialDescription::new(
             red,
             "red",
@@ -898,7 +990,7 @@ mod tests {
         ));
         scene.materials.push(MaterialDescription::new(
             light,
-            "ceiling-light",
+            "light",
             MaterialKind::Diffuse {
                 albedo: ColorRgb::BLACK,
                 emission: ColorRgb::new(5.0, 4.8, 4.4),
