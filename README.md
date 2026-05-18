@@ -18,3 +18,5 @@ Before changing code, read:
 - `cargo fmt`
 - `cargo clippy --workspace --all-targets`
 - `cargo test --workspace`
+
+Standalone Margaret is licensed under AGPL v3, and only MIT licensed when used as part of the WyrmCoil Engine.
