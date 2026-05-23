@@ -13,6 +13,7 @@ const MIN_HIT_DISTANCE: f32 = 0.000_1;
 const SHADOW_BIAS: f32 = 0.001;
 const MISS_COLOR: ColorRgba8 = ColorRgba8::new(18, 24, 32, 255);
 const DEPTH_MISS_COLOR: ColorRgba8 = ColorRgba8::new(0, 0, 0, 255);
+const PI: f32 = std::f32::consts::PI;
 const INV_PI: f32 = 0.318_309_87;
 const LIT_SAMPLES_PER_PIXEL: u32 = 16;
 const MAX_PATH_VERTICES: u32 = 4;
@@ -89,10 +90,18 @@ impl CpuRendererBackend {
 fn validate_supported_scene(scene: &SceneDescription) {
     for material in &scene.materials {
         assert!(
-            !material.has_unsupported_m3a_diffuse_emission_mix(),
-            "M3a does not support diffuse materials with both non-black albedo and non-black emission: '{}'",
+            !material.has_unsupported_diffuse_emission_mix(),
+            "M3b does not support diffuse materials with both non-black albedo and non-black emission: '{}'",
             material.name,
         );
+
+        if let MaterialKind::RoughReflector { roughness, .. } = material.kind {
+            assert!(
+                (0.0..=1.0).contains(&roughness),
+                "rough reflector roughness must stay within [0, 1]: '{}'",
+                material.name,
+            );
+        }
     }
 }
 
@@ -191,6 +200,12 @@ enum PathEvent {
         fresnel_reflectance: f32,
         reflected_ray: Ray,
         refracted_ray: Option<Ray>,
+    },
+    RoughReflection {
+        reflectance: ColorRgb,
+        roughness: f32,
+        bounce_ray: Ray,
+        sample_weight: ColorRgb,
     },
 }
 
@@ -354,6 +369,22 @@ fn trace_lit_path(
 
             emitted + reflected + transmitted
         }
+        PathEvent::RoughReflection {
+            bounce_ray,
+            sample_weight,
+            ..
+        } => {
+            emitted
+                + sample_weight
+                    * trace_lit_path(
+                        scene,
+                        bounce_ray,
+                        emissive_triangles,
+                        rng,
+                        next_remaining_vertices,
+                        true,
+                    )
+        }
     }
 }
 
@@ -387,6 +418,10 @@ fn build_path_event(
         MaterialKind::Dielectric { refractive_index } => {
             build_dielectric_event(incoming_ray, hit, refractive_index)
         }
+        MaterialKind::RoughReflector {
+            reflectance,
+            roughness,
+        } => build_rough_reflection_event(incoming_ray, hit, reflectance, roughness, rng),
     }
 }
 
@@ -423,6 +458,56 @@ fn build_dielectric_event(incoming_ray: Ray, hit: &SceneHit, refractive_index: f
     }
 }
 
+fn build_rough_reflection_event(
+    incoming_ray: Ray,
+    hit: &SceneHit,
+    reflectance: ColorRgb,
+    roughness: f32,
+    rng: &mut PixelRng,
+) -> PathEvent {
+    let surface_normal = scatter_normal(hit);
+    let incoming_direction = incoming_ray.direction.normalized();
+    let view_direction = -incoming_direction;
+    let alpha = roughness_to_alpha(roughness);
+
+    let half_vector = sample_ggx_half_vector(surface_normal, alpha, rng);
+    let bounce_direction = reflect(incoming_direction, half_vector);
+    let surface_cosine = surface_normal.dot(bounce_direction);
+
+    if surface_cosine <= 0.0 {
+        let fallback_direction = reflect(incoming_direction, surface_normal);
+        let fallback_origin = offset_ray_origin(hit.position, hit.normal, fallback_direction);
+        return PathEvent::RoughReflection {
+            reflectance,
+            roughness,
+            bounce_ray: Ray::new(fallback_origin, fallback_direction),
+            sample_weight: reflectance,
+        };
+    }
+
+    let view_half_cosine = view_direction.dot(half_vector).clamp(0.0, 1.0);
+    let normal_view_cosine = surface_normal.dot(view_direction).clamp(0.0, 1.0);
+    let normal_half_cosine = surface_normal.dot(half_vector).clamp(0.0, 1.0);
+    let pdf = rough_reflection_pdf(alpha, normal_half_cosine, view_half_cosine);
+    let sample_weight = evaluate_rough_reflection_weight(
+        reflectance,
+        alpha,
+        normal_view_cosine,
+        surface_cosine,
+        normal_half_cosine,
+        view_half_cosine,
+        pdf,
+    );
+    let bounce_origin = offset_ray_origin(hit.position, hit.normal, bounce_direction);
+
+    PathEvent::RoughReflection {
+        reflectance,
+        roughness,
+        bounce_ray: Ray::new(bounce_origin, bounce_direction),
+        sample_weight,
+    }
+}
+
 fn sample_cosine_weighted_hemisphere(normal: Vec3, rng: &mut PixelRng) -> Vec3 {
     let sample_a = rng.next_f32();
     let sample_b = rng.next_f32();
@@ -438,6 +523,97 @@ fn sample_cosine_weighted_hemisphere(normal: Vec3, rng: &mut PixelRng) -> Vec3 {
     let direction = tangent * local_x + bitangent * local_y + normal * local_z;
 
     direction.normalized()
+}
+
+fn sample_ggx_half_vector(normal: Vec3, alpha: f32, rng: &mut PixelRng) -> Vec3 {
+    let sample_a = rng.next_f32().clamp(0.000_001, 0.999_999);
+    let sample_b = rng.next_f32();
+    let phi = 2.0 * PI * sample_b;
+    let tan_theta_squared = alpha * alpha * sample_a / (1.0 - sample_a);
+    let cos_theta = 1.0 / (1.0 + tan_theta_squared).sqrt();
+    let sin_theta = (1.0 - cos_theta * cos_theta).max(0.0).sqrt();
+    let tangent = build_tangent(normal);
+    let bitangent = normal.cross(tangent).normalized();
+    let local_half = Vec3::new(sin_theta * phi.cos(), sin_theta * phi.sin(), cos_theta);
+    let half_vector = tangent * local_half.x + bitangent * local_half.y + normal * local_half.z;
+
+    half_vector.normalized()
+}
+
+fn roughness_to_alpha(roughness: f32) -> f32 {
+    roughness.max(0.02).powi(2)
+}
+
+fn ggx_normal_distribution(alpha: f32, normal_half_cosine: f32) -> f32 {
+    if normal_half_cosine <= 0.0 {
+        return 0.0;
+    }
+
+    let alpha_squared = alpha * alpha;
+    let denominator = normal_half_cosine * normal_half_cosine * (alpha_squared - 1.0) + 1.0;
+
+    alpha_squared / (PI * denominator * denominator)
+}
+
+fn smith_ggx_g1(alpha: f32, normal_cosine: f32) -> f32 {
+    if normal_cosine <= 0.0 {
+        return 0.0;
+    }
+
+    let normal_cosine_squared = normal_cosine * normal_cosine;
+    let tangent_squared = ((1.0 - normal_cosine_squared) / normal_cosine_squared).max(0.0);
+    let lambda = 0.5 * ((1.0 + alpha * alpha * tangent_squared).sqrt() - 1.0);
+
+    1.0 / (1.0 + lambda)
+}
+
+fn smith_ggx_geometry(alpha: f32, normal_view_cosine: f32, normal_light_cosine: f32) -> f32 {
+    smith_ggx_g1(alpha, normal_view_cosine) * smith_ggx_g1(alpha, normal_light_cosine)
+}
+
+fn schlick_fresnel_color(cosine: f32, reflectance: ColorRgb) -> ColorRgb {
+    let factor = (1.0 - cosine.clamp(0.0, 1.0)).powi(5);
+
+    reflectance + (ColorRgb::WHITE - reflectance) * factor
+}
+
+fn rough_reflection_pdf(alpha: f32, normal_half_cosine: f32, view_half_cosine: f32) -> f32 {
+    if normal_half_cosine <= 0.0 || view_half_cosine <= 0.0 {
+        return 0.0;
+    }
+
+    ggx_normal_distribution(alpha, normal_half_cosine) * normal_half_cosine
+        / (4.0 * view_half_cosine)
+}
+
+fn evaluate_rough_reflection_weight(
+    reflectance: ColorRgb,
+    alpha: f32,
+    normal_view_cosine: f32,
+    normal_light_cosine: f32,
+    normal_half_cosine: f32,
+    view_half_cosine: f32,
+    pdf: f32,
+) -> ColorRgb {
+    if normal_view_cosine <= 0.0
+        || normal_light_cosine <= 0.0
+        || normal_half_cosine <= 0.0
+        || view_half_cosine <= 0.0
+        || pdf <= 0.0
+    {
+        return ColorRgb::BLACK;
+    }
+
+    let distribution = ggx_normal_distribution(alpha, normal_half_cosine);
+    let geometry = smith_ggx_geometry(alpha, normal_view_cosine, normal_light_cosine);
+    let fresnel = schlick_fresnel_color(view_half_cosine, reflectance);
+    let brdf =
+        fresnel * (distribution * geometry / (4.0 * normal_view_cosine * normal_light_cosine));
+
+    // This path samples the GGX half-vector distribution and then reflects about it.
+    // The estimator uses brdf * cos(theta_o) / pdf, which keeps rough glossy events
+    // explicit without introducing a full BSDF framework or diffuse-style next-event logic.
+    brdf * (normal_light_cosine / pdf)
 }
 
 fn build_tangent(normal: Vec3) -> Vec3 {
@@ -682,10 +858,10 @@ fn to_u8(value: f32) -> u8 {
 mod tests {
     use super::{
         build_dielectric_event, build_path_event, closest_hit, color_rgb_to_rgba8, find_material,
-        intersect_triangle, miss_color, reflect, sample_cosine_weighted_hemisphere,
-        schlick_fresnel, trace_lit_path, validate_supported_scene, CpuRendererBackend, PathEvent,
-        PixelRng, SceneHit, DEPTH_MISS_COLOR, LIT_SAMPLES_PER_PIXEL, MAX_PATH_VERTICES,
-        MIN_HIT_DISTANCE, MISS_COLOR,
+        intersect_triangle, miss_color, reflect, rough_reflection_pdf,
+        sample_cosine_weighted_hemisphere, schlick_fresnel, smith_ggx_geometry, trace_lit_path,
+        validate_supported_scene, CpuRendererBackend, PathEvent, PixelRng, SceneHit,
+        DEPTH_MISS_COLOR, LIT_SAMPLES_PER_PIXEL, MAX_PATH_VERTICES, MIN_HIT_DISTANCE, MISS_COLOR,
     };
     use margaret_core::camera::Camera;
     use margaret_core::color::{ColorRgb, ColorRgba8};
@@ -971,6 +1147,98 @@ mod tests {
     }
 
     #[test]
+    fn rough_reflection_path_sees_emitter_after_glossy_bounce() {
+        let scene = rough_reflection_scene(0.28);
+        let lights = super::collect_emissive_triangles(&scene);
+        let ray = Ray::new(Point3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 0.0, -1.0));
+        let mut rng = PixelRng::new(14, 15);
+
+        let color = trace_lit_path(&scene, ray, &lights, &mut rng, MAX_PATH_VERTICES, true);
+
+        assert!(color.r > 0.0);
+        assert!(color.g > 0.0);
+        assert!(color.b > 0.0);
+    }
+
+    #[test]
+    fn rough_reflection_event_changes_bounce_direction_and_weight_with_roughness() {
+        let incoming_ray = Ray::new(Point3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 0.0, -1.0));
+        let hit = SceneHit {
+            distance: 1.0,
+            position: Point3::ORIGIN,
+            normal: Vec3::new(0.0, 0.0, 1.0),
+            front_face: true,
+            material_id: MaterialId(0),
+        };
+        let smooth_material = MaterialDescription::new(
+            MaterialId(0),
+            "smooth-rough-metal",
+            MaterialKind::RoughReflector {
+                reflectance: ColorRgb::new(0.9, 0.8, 0.7),
+                roughness: 0.05,
+            },
+        );
+        let rough_material = MaterialDescription::new(
+            MaterialId(1),
+            "rough-metal",
+            MaterialKind::RoughReflector {
+                reflectance: ColorRgb::new(0.9, 0.8, 0.7),
+                roughness: 0.6,
+            },
+        );
+
+        let mut smooth_rng = PixelRng::new(7, 8);
+        let smooth_event = build_path_event(&smooth_material, incoming_ray, &hit, &mut smooth_rng);
+        let mut rough_rng = PixelRng::new(7, 8);
+        let rough_event = build_path_event(&rough_material, incoming_ray, &hit, &mut rough_rng);
+
+        let PathEvent::RoughReflection {
+            bounce_ray: smooth_ray,
+            sample_weight: smooth_weight,
+            ..
+        } = smooth_event
+        else {
+            panic!("expected rough reflection event");
+        };
+        let PathEvent::RoughReflection {
+            bounce_ray: rough_ray,
+            sample_weight: rough_weight,
+            ..
+        } = rough_event
+        else {
+            panic!("expected rough reflection event");
+        };
+
+        assert!(smooth_ray.direction.z > 0.0);
+        assert!(rough_ray.direction.z > 0.0);
+        assert_near_unit_interval(smooth_weight.r);
+        assert_near_unit_interval(smooth_weight.g);
+        assert_near_unit_interval(smooth_weight.b);
+        assert_near_unit_interval(rough_weight.r);
+        assert_near_unit_interval(rough_weight.g);
+        assert_near_unit_interval(rough_weight.b);
+        assert!(
+            (smooth_ray.direction.x - rough_ray.direction.x).abs() > 0.01
+                || (smooth_ray.direction.y - rough_ray.direction.y).abs() > 0.01
+        );
+        assert!(
+            (smooth_weight.r - rough_weight.r).abs() > 0.000_1
+                || (smooth_weight.g - rough_weight.g).abs() > 0.000_1
+                || (smooth_weight.b - rough_weight.b).abs() > 0.000_1
+        );
+    }
+
+    #[test]
+    fn rough_reflection_pdf_and_geometry_terms_stay_positive_for_valid_configuration() {
+        let pdf = rough_reflection_pdf(0.09, 0.92, 0.88);
+        let geometry = smith_ggx_geometry(0.09, 0.93, 0.81);
+
+        assert!(pdf > 0.0);
+        assert!(geometry > 0.0);
+        assert!(geometry <= 1.0);
+    }
+
+    #[test]
     fn dielectric_path_transmits_emitter_at_normal_incidence() {
         let scene = glass_transmission_scene();
         let lights = super::collect_emissive_triangles(&scene);
@@ -1193,7 +1461,7 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "M3a does not support diffuse materials with both non-black albedo and non-black emission"
+        expected = "M3b does not support diffuse materials with both non-black albedo and non-black emission"
     )]
     fn validate_supported_scene_rejects_mixed_diffuse_emission_materials() {
         let camera = Camera::new(
@@ -1648,6 +1916,73 @@ mod tests {
         scene
     }
 
+    fn rough_reflection_scene(roughness: f32) -> SceneDescription {
+        let camera = Camera::new(
+            "main",
+            Point3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            Vec3::Y,
+            45.0,
+        );
+        let rough_reflector = MaterialId(0);
+        let light = MaterialId(1);
+
+        let mut scene = SceneDescription::new("rough-reflection", camera);
+        scene.materials.push(MaterialDescription::new(
+            rough_reflector,
+            "rough-metal",
+            MaterialKind::RoughReflector {
+                reflectance: ColorRgb::new(0.9, 0.8, 0.7),
+                roughness,
+            },
+        ));
+        scene.materials.push(make_diffuse(
+            light,
+            "light",
+            ColorRgb::BLACK,
+            ColorRgb::new(3.0, 2.8, 2.4),
+        ));
+
+        scene.objects.push(SceneObject::new(
+            "rough-metal",
+            Geometry::TriangleMesh {
+                triangles: vec![
+                    Triangle::new(
+                        Point3::new(-1.0, -1.0, 0.0),
+                        Point3::new(1.0, -1.0, 0.0),
+                        Point3::new(1.0, 1.0, 0.0),
+                    ),
+                    Triangle::new(
+                        Point3::new(-1.0, -1.0, 0.0),
+                        Point3::new(1.0, 1.0, 0.0),
+                        Point3::new(-1.0, 1.0, 0.0),
+                    ),
+                ],
+            },
+            rough_reflector,
+        ));
+        scene.objects.push(SceneObject::new(
+            "light",
+            Geometry::TriangleMesh {
+                triangles: vec![
+                    Triangle::new(
+                        Point3::new(-1.0, -1.0, 2.0),
+                        Point3::new(1.0, 1.0, 2.0),
+                        Point3::new(1.0, -1.0, 2.0),
+                    ),
+                    Triangle::new(
+                        Point3::new(-1.0, -1.0, 2.0),
+                        Point3::new(-1.0, 1.0, 2.0),
+                        Point3::new(1.0, 1.0, 2.0),
+                    ),
+                ],
+            },
+            light,
+        ));
+
+        scene
+    }
+
     fn glass_transmission_scene() -> SceneDescription {
         let camera = Camera::new(
             "main",
@@ -1854,5 +2189,9 @@ mod tests {
         assert!((actual.x - expected.x).abs() <= epsilon);
         assert!((actual.y - expected.y).abs() <= epsilon);
         assert!((actual.z - expected.z).abs() <= epsilon);
+    }
+
+    fn assert_near_unit_interval(value: f32) {
+        assert!((0.0..=1.5).contains(&value));
     }
 }

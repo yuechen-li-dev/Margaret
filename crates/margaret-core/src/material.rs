@@ -24,15 +24,16 @@ impl MaterialDescription {
             MaterialKind::Diffuse { albedo, .. } => albedo,
             MaterialKind::SpecularReflector { reflectance } => reflectance,
             MaterialKind::Dielectric { .. } => ColorRgb::WHITE,
+            MaterialKind::RoughReflector { reflectance, .. } => reflectance,
         }
     }
 
     pub fn emissive_radiance(&self) -> ColorRgb {
         match self.kind {
             MaterialKind::Diffuse { emission, .. } => emission,
-            MaterialKind::SpecularReflector { .. } | MaterialKind::Dielectric { .. } => {
-                ColorRgb::BLACK
-            }
+            MaterialKind::SpecularReflector { .. }
+            | MaterialKind::Dielectric { .. }
+            | MaterialKind::RoughReflector { .. } => ColorRgb::BLACK,
         }
     }
 
@@ -40,12 +41,14 @@ impl MaterialDescription {
         self.emissive_radiance() != ColorRgb::BLACK
     }
 
-    pub fn has_unsupported_m3a_diffuse_emission_mix(&self) -> bool {
+    pub fn has_unsupported_diffuse_emission_mix(&self) -> bool {
         match self.kind {
             MaterialKind::Diffuse { albedo, emission } => {
                 albedo != ColorRgb::BLACK && emission != ColorRgb::BLACK
             }
-            MaterialKind::SpecularReflector { .. } | MaterialKind::Dielectric { .. } => false,
+            MaterialKind::SpecularReflector { .. }
+            | MaterialKind::Dielectric { .. }
+            | MaterialKind::RoughReflector { .. } => false,
         }
     }
 }
@@ -61,5 +64,9 @@ pub enum MaterialKind {
     },
     Dielectric {
         refractive_index: f32,
+    },
+    RoughReflector {
+        reflectance: ColorRgb,
+        roughness: f32,
     },
 }

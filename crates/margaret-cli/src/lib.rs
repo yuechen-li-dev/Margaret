@@ -12,7 +12,7 @@ use margaret_core::scene::{Geometry, SceneDescription, SceneObject, Triangle};
 use margaret_cpu::CpuRendererBackend;
 
 const DEFAULT_DEPTH_MAX_DISTANCE: f32 = 6.0;
-const DEFAULT_OUTPUT_PATH: &str = "margaret-m3a-normals.ppm";
+const DEFAULT_OUTPUT_PATH: &str = "margaret-m3b-normals.ppm";
 
 pub fn run() -> std::io::Result<()> {
     run_from_args(env::args_os())
@@ -40,7 +40,7 @@ where
 
     image.write_ppm(&config.output_path)?;
 
-    println!("Margaret M3a CPU path trace");
+    println!("Margaret M3b CPU path trace");
     println!("scene: {}", metadata.scene_name);
     println!("backend: {}", metadata.backend_name);
     println!("mode: {}", config.render_settings.mode.as_str());
@@ -105,7 +105,7 @@ impl CliConfig {
                     config.render_settings.mode = render_mode;
                     if config.output_path == Path::new(DEFAULT_OUTPUT_PATH) {
                         config.output_path =
-                            PathBuf::from(format!("margaret-m3a-{}.ppm", render_mode.as_str()));
+                            PathBuf::from(format!("margaret-m3b-{}.ppm", render_mode.as_str()));
                     }
                 }
                 "--width" => {
@@ -197,8 +197,9 @@ fn hardcoded_scene() -> SceneDescription {
     let light = MaterialId(3);
     let mirror = MaterialId(4);
     let glass = MaterialId(5);
+    let rough_metal = MaterialId(6);
 
-    let mut scene = SceneDescription::new("m3a-hardcoded-path-scene", camera);
+    let mut scene = SceneDescription::new("m3b-hardcoded-path-scene", camera);
     scene.materials.push(make_diffuse(
         red,
         "red",
@@ -235,6 +236,14 @@ fn hardcoded_scene() -> SceneDescription {
         "glass",
         MaterialKind::Dielectric {
             refractive_index: 1.5,
+        },
+    ));
+    scene.materials.push(MaterialDescription::new(
+        rough_metal,
+        "rough-metal",
+        MaterialKind::RoughReflector {
+            reflectance: ColorRgb::new(0.92, 0.78, 0.62),
+            roughness: 0.28,
         },
     ));
 
@@ -282,17 +291,25 @@ fn hardcoded_scene() -> SceneDescription {
         "mirror-panel",
         mirror,
         Point3::new(-0.9, -1.0, -0.2),
-        Point3::new(-0.15, -1.0, -0.7),
-        Point3::new(-0.15, 0.2, -0.7),
+        Point3::new(-0.35, -1.0, -0.7),
+        Point3::new(-0.35, 0.2, -0.7),
         Point3::new(-0.9, 0.2, -0.2),
+    ));
+    scene.objects.push(make_quad(
+        "rough-metal-panel",
+        rough_metal,
+        Point3::new(-0.18, -1.0, -0.78),
+        Point3::new(0.18, -1.0, -0.78),
+        Point3::new(0.18, 0.35, -0.78),
+        Point3::new(-0.18, 0.35, -0.78),
     ));
     scene.objects.push(make_quad(
         "glass-panel",
         glass,
-        Point3::new(0.15, -1.0, -0.7),
+        Point3::new(0.35, -1.0, -0.7),
         Point3::new(0.9, -1.0, -0.2),
         Point3::new(0.9, 0.35, -0.2),
-        Point3::new(0.15, 0.35, -0.7),
+        Point3::new(0.35, 0.35, -0.7),
     ));
     scene.objects.push(make_quad(
         "light",
@@ -350,23 +367,26 @@ mod tests {
     fn hardcoded_scene_contains_room_geometry_light_and_delta_materials() {
         let scene = hardcoded_scene();
 
-        assert_eq!(scene.objects.len(), 8);
-        assert_eq!(scene.materials.len(), 6);
+        assert_eq!(scene.objects.len(), 9);
+        assert_eq!(scene.materials.len(), 7);
         assert_eq!(scene.lights.len(), 0);
 
         let mut mirror_count = 0;
         let mut dielectric_count = 0;
+        let mut rough_reflector_count = 0;
 
         for material in &scene.materials {
             match material.kind {
                 MaterialKind::Diffuse { .. } => {}
                 MaterialKind::SpecularReflector { .. } => mirror_count += 1,
                 MaterialKind::Dielectric { .. } => dielectric_count += 1,
+                MaterialKind::RoughReflector { .. } => rough_reflector_count += 1,
             }
         }
 
         assert_eq!(mirror_count, 1);
         assert_eq!(dielectric_count, 1);
+        assert_eq!(rough_reflector_count, 1);
 
         for object in &scene.objects {
             match &object.geometry {
@@ -414,7 +434,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.render_settings.mode, RenderMode::Lit);
-        assert_eq!(config.output_path, PathBuf::from("margaret-m3a-lit.ppm"));
+        assert_eq!(config.output_path, PathBuf::from("margaret-m3b-lit.ppm"));
     }
 
     #[test]
@@ -442,7 +462,7 @@ mod tests {
             config.render_settings.mode,
             RenderMode::Debug(RenderDebugMode::Depth)
         );
-        assert_eq!(config.output_path, PathBuf::from("margaret-m3a-depth.ppm"));
+        assert_eq!(config.output_path, PathBuf::from("margaret-m3b-depth.ppm"));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::ops::{Add, AddAssign, Mul};
+use std::ops::{Add, AddAssign, Mul, Sub};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ColorRgb {
@@ -29,6 +29,14 @@ impl AddAssign for ColorRgb {
         self.r += rhs.r;
         self.g += rhs.g;
         self.b += rhs.b;
+    }
+}
+
+impl Sub for ColorRgb {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self::new(self.r - rhs.r, self.g - rhs.g, self.b - rhs.b)
     }
 }
 
